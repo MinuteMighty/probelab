@@ -1,0 +1,23 @@
+name: hackernews
+description: Verify Hacker News front page loads and has stories
+
+target:
+  type: web
+  url: https://news.ycombinator.com/
+
+steps:
+  - action: goto
+    url: https://news.ycombinator.com/
+
+assertions:
+  - type: text_exists
+    text: "Hacker News"
+  - type: selector_exists
+    selector: "span.titleline > a"
+  - type: selector_count
+    selector: "span.titleline > a"
+    min: 10
+
+outputs:
+  - type: screenshot
+  - type: html

@@ -1,0 +1,27 @@
+name: bu-imdb-movie
+description: "Common agent task: IMDB movie page data extraction"
+tags: [browser-use, entertainment]
+
+target:
+  type: web
+  url: https://www.imdb.com/title/tt1375666/
+
+steps:
+  - action: goto
+    url: https://www.imdb.com/title/tt1375666/
+
+assertions:
+  - type: text_exists
+    text: "Inception"
+  - type: selector_exists
+    selector: "[data-testid='hero__pageTitle'], h1"
+  - type: selector_exists
+    selector: "[data-testid='hero-rating-bar__aggregate-rating__score']"
+  - type: selector_exists
+    selector: "[data-testid='title-cast-item']"
+  - type: selector_count
+    selector: "[data-testid='title-cast-item']"
+    min: 3
+
+outputs:
+  - type: screenshot

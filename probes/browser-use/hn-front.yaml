@@ -1,0 +1,31 @@
+name: bu-hn-front
+description: "Common agent task: extract HN front page stories"
+tags: [browser-use, news]
+
+target:
+  type: web
+  url: https://news.ycombinator.com/
+
+steps:
+  - action: goto
+    url: https://news.ycombinator.com/
+
+assertions:
+  - type: text_exists
+    text: "Hacker News"
+  - type: selector_exists
+    selector: "tr.athing"
+  - type: selector_count
+    selector: "tr.athing"
+    min: 20
+  - type: selector_exists
+    selector: ".titleline > a"
+  - type: selector_exists
+    selector: ".score"
+  - type: selector_exists
+    selector: ".hnuser"
+  - type: selector_exists
+    selector: "a[href*='item?id=']"
+
+outputs:
+  - type: screenshot

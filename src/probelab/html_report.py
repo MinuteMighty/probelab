@@ -1,9 +1,9 @@
 """Self-contained HTML report generator.
 
-Renders all probe results — status table, DOM diff tree, sparkline timeline,
-drift alerts, and repair suggestions — as a single HTML file with inline CSS.
-No JavaScript frameworks, no external dependencies. One file you can open in
-any browser or attach to a CI artifact.
+Renders probe results grouped by site/adapter — site overview table,
+collapsible per-site detail cards with DOM diff, sparkline timeline,
+drift alerts, and repair suggestions. Single HTML file, inline CSS,
+no JavaScript frameworks.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ _COLORS = {
     "degraded": "#eab308",
     "broken": "#ef4444",
     "error": "#ef4444",
+    "skipped": "#64748b",
     "bg": "#0f172a",
     "card": "#1e293b",
     "border": "#334155",
@@ -40,7 +41,46 @@ _STATUS_ICON = {
     Status.DEGRADED: "&#126;",    # ~
     Status.BROKEN: "&#10007;",    # ✗
     Status.ERROR: "&#33;",        # !
+    Status.SKIPPED: "&#8211;",    # –
 }
+
+_STATUS_SEVERITY = {
+    Status.SKIPPED: -1,
+    Status.HEALTHY: 0,
+    Status.DEGRADED: 1,
+    Status.BROKEN: 2,
+    Status.ERROR: 3,
+}
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Grouping helpers
+# ─────────────────────────────────────────────────────────────────────
+
+def _extract_site(result: ProbeResult) -> str:
+    """Extract site name from a probe result."""
+    tags = result.tags
+    if len(tags) >= 2 and tags[0] == "opencli":
+        return tags[1]
+    if tags:
+        return tags[0]
+    if "-" in result.probe_name:
+        return result.probe_name.split("-", 1)[0]
+    return result.probe_name
+
+
+def _group_by_site(results: list[ProbeResult]) -> dict[str, list[ProbeResult]]:
+    """Group probe results by site."""
+    groups: dict[str, list[ProbeResult]] = {}
+    for r in results:
+        site = _extract_site(r)
+        groups.setdefault(site, []).append(r)
+    return groups
+
+
+def _site_status(results: list[ProbeResult]) -> Status:
+    """Return the worst status among a list of probe results."""
+    return max(results, key=lambda r: _STATUS_SEVERITY.get(r.status, 3)).status
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -51,36 +91,54 @@ def generate_html_report(
     results: list[ProbeResult],
     history_map: dict[str, list[dict[str, Any]]] | None = None,
 ) -> str:
-    """Generate a full HTML report string.
-
-    Args:
-        results: Current probe results.
-        history_map: Optional {probe_name: [history_entries]} for timelines.
-
-    Returns:
-        Complete HTML document as a string.
-    """
+    """Generate a full HTML report string, grouped by site."""
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    healthy = sum(1 for r in results if r.status == Status.HEALTHY)
-    broken = sum(1 for r in results if r.status in (Status.BROKEN, Status.ERROR))
-    degraded = sum(1 for r in results if r.status == Status.DEGRADED)
-    total = len(results)
+
+    site_groups = _group_by_site(results)
+
+    total_probes = len(results)
+    total_sites = len(site_groups)
+    healthy_probes = sum(1 for r in results if r.status == Status.HEALTHY)
+    broken_probes = sum(1 for r in results if r.status in (Status.BROKEN, Status.ERROR))
+    degraded_probes = sum(1 for r in results if r.status == Status.DEGRADED)
+    skipped_probes = sum(1 for r in results if r.status == Status.SKIPPED)
+    tested_probes = total_probes - skipped_probes
+
+    healthy_sites = sum(
+        1 for probes in site_groups.values()
+        if _site_status(probes) == Status.HEALTHY
+    )
+    skipped_sites = sum(
+        1 for probes in site_groups.values()
+        if all(p.status == Status.SKIPPED for p in probes)
+    )
+    broken_sites = total_sites - healthy_sites - skipped_sites
 
     sections: list[str] = []
 
-    # Summary bar
-    sections.append(_render_summary(total, healthy, degraded, broken, now))
+    # 1. Summary bar (site-centric)
+    sections.append(_render_site_summary(
+        total_sites, healthy_sites, broken_sites, skipped_sites,
+        total_probes, tested_probes, healthy_probes, skipped_probes, now,
+    ))
 
-    # Status table
-    sections.append(_render_status_table(results))
+    # 2. Site overview table
+    sections.append(_render_site_overview_table(site_groups))
 
-    # Per-probe detail cards
-    for result in results:
-        hist = (history_map or {}).get(result.probe_name, [])
-        sections.append(_render_probe_card(result, hist))
+    # 3. Per-site detail cards (broken first)
+    sorted_sites = sorted(
+        site_groups.items(),
+        key=lambda item: (_STATUS_SEVERITY.get(_site_status(item[1]), 3), item[0]),
+        reverse=True,
+    )
+    for site_name, site_probes in sorted_sites:
+        sections.append(_render_site_detail_card(
+            site_name, site_probes, history_map or {},
+        ))
 
     body = "\n".join(sections)
-    return _wrap_page(body, total, healthy, broken, degraded)
+    return _wrap_page(body, total_probes, healthy_probes, broken_probes, degraded_probes,
+                      total_sites, healthy_sites)
 
 
 def write_html_report(
@@ -95,58 +153,87 @@ def write_html_report(
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Summary bar
+# Site summary bar
 # ─────────────────────────────────────────────────────────────────────
 
-def _render_summary(total: int, healthy: int, degraded: int, broken: int, timestamp: str) -> str:
+def _render_site_summary(
+    total_sites: int, healthy_sites: int, broken_sites: int, skipped_sites: int,
+    total_probes: int, tested_probes: int, healthy_probes: int, skipped_probes: int,
+    timestamp: str,
+) -> str:
     return f"""
     <div class="summary">
       <div class="summary-stat">
-        <span class="stat-number">{total}</span>
-        <span class="stat-label">Total</span>
+        <span class="stat-number">{total_sites}</span>
+        <span class="stat-label">Sites</span>
       </div>
       <div class="summary-stat">
-        <span class="stat-number" style="color:{_COLORS['healthy']}">{healthy}</span>
+        <span class="stat-number" style="color:{_COLORS['healthy']}">{healthy_sites}</span>
         <span class="stat-label">Healthy</span>
       </div>
       <div class="summary-stat">
-        <span class="stat-number" style="color:{_COLORS['degraded']}">{degraded}</span>
-        <span class="stat-label">Degraded</span>
+        <span class="stat-number" style="color:{_COLORS['broken']}">{broken_sites}</span>
+        <span class="stat-label">Broken</span>
       </div>
       <div class="summary-stat">
-        <span class="stat-number" style="color:{_COLORS['broken']}">{broken}</span>
-        <span class="stat-label">Broken</span>
+        <span class="stat-number" style="color:{_COLORS['skipped']}">{skipped_sites}</span>
+        <span class="stat-label">Need Browser</span>
+      </div>
+      <div class="summary-divider"></div>
+      <div class="summary-stat">
+        <span class="stat-number" style="font-size:20px">{healthy_probes}/{tested_probes}</span>
+        <span class="stat-label">Tested OK</span>
+      </div>
+      <div class="summary-stat">
+        <span class="stat-number" style="font-size:20px;color:{_COLORS['skipped']}">{skipped_probes}</span>
+        <span class="stat-label">Skipped</span>
       </div>
       <div class="summary-timestamp">{_e(timestamp)}</div>
     </div>"""
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Status table
+# Site overview table
 # ─────────────────────────────────────────────────────────────────────
 
-def _render_status_table(results: list[ProbeResult]) -> str:
+def _render_site_overview_table(site_groups: dict[str, list[ProbeResult]]) -> str:
     rows: list[str] = []
-    for r in results:
-        color = _COLORS.get(r.status.value, _COLORS["dim"])
-        icon = _STATUS_ICON.get(r.status, "?")
-        details = _build_details_text(r)
-        time_str = f"{r.response_time_ms}ms" if r.response_time_ms > 0 else "-"
+
+    sorted_sites = sorted(
+        site_groups.items(),
+        key=lambda item: (_STATUS_SEVERITY.get(_site_status(item[1]), 3), item[0]),
+        reverse=True,
+    )
+
+    for site_name, probes in sorted_sites:
+        status = _site_status(probes)
+        color = _COLORS.get(status.value, _COLORS["dim"])
+        icon = _STATUS_ICON.get(status, "?")
+        total = len(probes)
+        healthy = sum(1 for p in probes if p.status == Status.HEALTHY)
+        broken_names = [
+            p.probe_name.split("-", 1)[1] if "-" in p.probe_name else p.probe_name
+            for p in probes if p.status in (Status.BROKEN, Status.ERROR)
+        ]
+        broken_list = ", ".join(broken_names[:5])
+        if len(broken_names) > 5:
+            broken_list += f" +{len(broken_names) - 5} more"
+
         rows.append(f"""
         <tr>
           <td class="icon" style="color:{color}">{icon}</td>
-          <td class="probe-name">{_e(r.probe_name)}</td>
-          <td><span class="status-badge" style="background:{color}20;color:{color}">{_e(r.status.value)}</span></td>
-          <td class="details">{_e(details)}</td>
-          <td class="time">{_e(time_str)}</td>
+          <td class="probe-name"><a href="#site-{_e(site_name)}">{_e(site_name)}</a></td>
+          <td><span class="status-badge" style="background:{color}20;color:{color}">{_e(status.value)}</span></td>
+          <td class="details">{healthy}/{total} probes OK</td>
+          <td class="details dim">{_e(broken_list) if broken_list else '-'}</td>
         </tr>""")
 
     return f"""
     <div class="card">
-      <h2>Probe Results</h2>
+      <h2>Site Overview</h2>
       <table class="results-table">
         <thead>
-          <tr><th></th><th>Probe</th><th>Status</th><th>Details</th><th>Time</th></tr>
+          <tr><th></th><th>Site</th><th>Status</th><th>Probes</th><th>Broken</th></tr>
         </thead>
         <tbody>{"".join(rows)}</tbody>
       </table>
@@ -154,29 +241,93 @@ def _render_status_table(results: list[ProbeResult]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Per-probe detail card
+# Per-site detail card (collapsible)
 # ─────────────────────────────────────────────────────────────────────
 
-def _render_probe_card(result: ProbeResult, history: list[dict[str, Any]]) -> str:
+def _render_site_detail_card(
+    site_name: str,
+    probes: list[ProbeResult],
+    history_map: dict[str, list[dict[str, Any]]],
+) -> str:
+    status = _site_status(probes)
+    color = _COLORS.get(status.value, _COLORS["dim"])
+    healthy = sum(1 for p in probes if p.status == Status.HEALTHY)
+    total = len(probes)
+    icon = _STATUS_ICON.get(status, "?")
+
+    # Probe table rows (broken first)
+    sorted_probes = sorted(
+        probes, key=lambda p: _STATUS_SEVERITY.get(p.status, 3), reverse=True,
+    )
+    probe_rows: list[str] = []
+    for r in sorted_probes:
+        r_color = _COLORS.get(r.status.value, _COLORS["dim"])
+        r_icon = _STATUS_ICON.get(r.status, "?")
+        # Show command name (strip site prefix)
+        cmd = r.probe_name.split("-", 1)[1] if "-" in r.probe_name else r.probe_name
+        details = _build_details_text(r)
+        time_str = f"{r.response_time_ms}ms" if r.response_time_ms > 0 else "-"
+        probe_rows.append(f"""
+          <tr>
+            <td class="icon" style="color:{r_color}">{r_icon}</td>
+            <td class="probe-name">{_e(cmd)}</td>
+            <td><span class="status-badge" style="background:{r_color}20;color:{r_color}">{_e(r.status.value)}</span></td>
+            <td class="details">{_e(details)}</td>
+            <td class="time">{_e(time_str)}</td>
+          </tr>""")
+
+    probe_table = f"""
+      <table class="results-table">
+        <thead>
+          <tr><th></th><th>Command</th><th>Status</th><th>Details</th><th>Time</th></tr>
+        </thead>
+        <tbody>{"".join(probe_rows)}</tbody>
+      </table>"""
+
+    # Per-probe diagnostics (only for non-healthy)
+    diagnostics: list[str] = []
+    for r in sorted_probes:
+        hist = history_map.get(r.probe_name, [])
+        card_html = _render_probe_diagnostics(r, hist)
+        if card_html:
+            diagnostics.append(card_html)
+
+    open_attr = " open" if status in (Status.BROKEN, Status.ERROR) else ""
+
+    return f"""
+    <div class="card site-card" id="site-{_e(site_name)}" style="border-left:3px solid {color}">
+      <details{open_attr}>
+        <summary class="site-header">
+          <span class="icon" style="color:{color};font-size:16px">{icon}</span>
+          <span class="site-name">{_e(site_name)}</span>
+          <span class="status-badge" style="background:{color}20;color:{color}">{_e(status.value)}</span>
+          <span class="site-probe-count">{healthy}/{total} probes OK</span>
+        </summary>
+        {probe_table}
+        {"".join(diagnostics)}
+      </details>
+    </div>"""
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Per-probe diagnostics (nested inside site card)
+# ─────────────────────────────────────────────────────────────────────
+
+def _render_probe_diagnostics(result: ProbeResult, history: list[dict[str, Any]]) -> str:
+    """Render diagnostics for a single probe (timeline, diff, drift, repair)."""
     if result.status == Status.HEALTHY and not result.dom_diff and not result.drift_alerts:
-        return ""  # Don't clutter with healthy cards
+        return ""
 
     color = _COLORS.get(result.status.value, _COLORS["dim"])
+    cmd = result.probe_name.split("-", 1)[1] if "-" in result.probe_name else result.probe_name
     sections: list[str] = []
 
-    # Timeline sparkline
     if history:
         sections.append(_render_timeline_section(history))
-
-    # DOM diff tree
     if result.dom_diff and result.dom_diff.get("changed"):
         sections.append(_render_dom_diff_section(result.dom_diff))
-
-    # Drift alerts
     if result.drift_alerts:
         sections.append(_render_drift_section(result.drift_alerts))
-
-    # Repair suggestions
     if result.repair_suggestions:
         broken_sel = ""
         broken_count = 0
@@ -191,10 +342,10 @@ def _render_probe_card(result: ProbeResult, history: list[dict[str, Any]]) -> st
         return ""
 
     return f"""
-    <div class="card probe-card" style="border-left:3px solid {color}">
-      <h2>{_e(result.probe_name)} <span class="card-status" style="color:{color}">{_e(result.status.value)}</span></h2>
-      {"".join(sections)}
-    </div>"""
+      <div class="probe-detail" style="border-left:2px solid {color}">
+        <h4 style="color:{color}">{_e(cmd)}</h4>
+        {"".join(sections)}
+      </div>"""
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -202,7 +353,6 @@ def _render_probe_card(result: ProbeResult, history: list[dict[str, Any]]) -> st
 # ─────────────────────────────────────────────────────────────────────
 
 def _render_timeline_section(history: list[dict[str, Any]]) -> str:
-    # Extract match counts per selector
     selector_series: dict[str, list[int]] = {}
     statuses: list[str] = []
     for entry in history:
@@ -214,14 +364,12 @@ def _render_timeline_section(history: list[dict[str, Any]]) -> str:
 
     parts: list[str] = []
 
-    # Status trail
     trail = "".join(
         f'<span class="trail-dot" style="background:{_COLORS.get(s, _COLORS["dim"])}" title="{s}"></span>'
         for s in statuses
     )
     parts.append(f'<div class="section-label">Status trail</div><div class="trail">{trail}</div>')
 
-    # SVG sparkline per selector
     for selector, values in selector_series.items():
         svg = _svg_sparkline(values, width=400, height=40)
         current = values[-1] if values else 0
@@ -252,13 +400,10 @@ def _svg_sparkline(values: list[int], width: int = 400, height: int = 40) -> str
         points.append(f"{x:.1f},{y:.1f}")
 
     polyline = " ".join(points)
-
-    # Fill area
     first_x = padding
     last_x = padding + ((n - 1) / max(n - 1, 1)) * (width - 2 * padding)
     fill_points = f"{first_x},{height} {polyline} {last_x},{height}"
 
-    # Color: green if last value is high, red if low
     last_pct = (values[-1] - lo) / span if span else 1
     if last_pct >= 0.6:
         color = _COLORS["healthy"]
@@ -288,17 +433,14 @@ def _render_dom_diff_section(dom_diff: dict[str, Any]) -> str:
     for change in changes[:15]:
         ctype = change.get("type", "?")
         path = change.get("path", "?")
-        detail = change.get("details", "")
         color = _COLORS.get(ctype, _COLORS["dim"])
-        icon = {"added": "+", "removed": "&minus;", "modified": "~"}.get(ctype, "?")
-
-        # Indent based on path depth
+        icon_ch = {"added": "+", "removed": "&minus;", "modified": "~"}.get(ctype, "?")
         depth = path.count(" > ")
         indent = depth * 20
 
         lines.append(
             f'<div class="diff-line" style="padding-left:{indent}px">'
-            f'<span class="diff-icon" style="color:{color}">{icon}</span>'
+            f'<span class="diff-icon" style="color:{color}">{icon_ch}</span>'
             f'<span style="color:{color}">{_e(path.split(" > ")[-1])}</span>'
             f'</div>'
         )
@@ -324,7 +466,6 @@ def _render_drift_section(alerts: list[dict[str, Any]]) -> str:
         severity = alert.get("severity", "warning")
         color = _COLORS["broken"] if severity == "critical" else _COLORS["degraded"]
         msg = alert.get("message", "")
-        sigma = alert.get("deviation_sigma", 0)
 
         items.append(
             f'<div class="alert" style="border-left:3px solid {color}">'
@@ -355,7 +496,6 @@ def _render_repair_section(
     if not samples_html:
         samples_html = '<div class="dim">(no preview available)</div>'
 
-    # Side-by-side panels
     left = (
         f'<div class="repair-panel broken-panel">'
         f'<div class="repair-label">BROKEN</div>'
@@ -374,7 +514,6 @@ def _render_repair_section(
         f'</div>'
     )
 
-    # Other candidates
     others = ""
     if len(suggestions) > 1:
         other_rows: list[str] = []
@@ -405,7 +544,10 @@ def _render_repair_section(
 # Page wrapper with inline CSS
 # ─────────────────────────────────────────────────────────────────────
 
-def _wrap_page(body: str, total: int, healthy: int, broken: int, degraded: int) -> str:
+def _wrap_page(
+    body: str, total: int, healthy: int, broken: int, degraded: int,
+    total_sites: int = 0, healthy_sites: int = 0,
+) -> str:
     if broken > 0:
         favicon_color = "red"
     elif degraded > 0:
@@ -413,7 +555,7 @@ def _wrap_page(body: str, total: int, healthy: int, broken: int, degraded: int) 
     else:
         favicon_color = "green"
 
-    title = f"probelab: {healthy}/{total} healthy"
+    title = f"probelab: {healthy_sites}/{total_sites} sites healthy ({healthy}/{total} probes)"
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -432,15 +574,13 @@ def _wrap_page(body: str, total: int, healthy: int, broken: int, degraded: int) 
     max-width: 960px;
     margin: 0 auto;
   }}
-  h1 {{
-    font-size: 20px;
-    font-weight: 600;
-    margin-bottom: 4px;
-  }}
+  a {{ color: {_COLORS['text']}; text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+  h1 {{ font-size: 20px; font-weight: 600; margin-bottom: 4px; }}
   h1 span {{ font-weight: 400; color: {_COLORS['dim']}; font-size: 14px; }}
   h2 {{ font-size: 16px; font-weight: 600; margin-bottom: 12px; }}
   h3 {{ font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: {_COLORS['dim']}; margin-bottom: 8px; }}
-  h4 {{ font-size: 13px; font-weight: 600; margin: 12px 0 6px; }}
+  h4 {{ font-size: 14px; font-weight: 600; margin: 0 0 8px; }}
   code {{
     font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
     font-size: 13px;
@@ -466,6 +606,7 @@ def _wrap_page(body: str, total: int, healthy: int, broken: int, degraded: int) 
   .summary-stat {{ text-align: center; }}
   .stat-number {{ font-size: 28px; font-weight: 700; display: block; }}
   .stat-label {{ font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: {_COLORS['dim']}; }}
+  .summary-divider {{ width: 1px; height: 40px; background: {_COLORS['border']}; }}
   .summary-timestamp {{ margin-left: auto; font-size: 12px; color: {_COLORS['dim']}; }}
 
   /* Cards */
@@ -476,6 +617,38 @@ def _wrap_page(body: str, total: int, healthy: int, broken: int, degraded: int) 
     margin-bottom: 16px;
   }}
   .card-status {{ font-size: 13px; font-weight: 500; }}
+
+  /* Site cards */
+  .site-card {{ padding: 0; overflow: hidden; }}
+  .site-card details {{ }}
+  .site-card details > *:not(summary) {{ padding: 0 20px; }}
+  .site-card details > table {{ padding: 0 20px; margin-bottom: 12px; }}
+  .site-header {{
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    cursor: pointer;
+    list-style: none;
+    padding: 16px 20px;
+  }}
+  .site-header::-webkit-details-marker {{ display: none; }}
+  .site-header::before {{
+    content: "\\25B6";
+    font-size: 10px;
+    color: {_COLORS['dim']};
+    transition: transform 0.2s;
+  }}
+  details[open] > .site-header::before {{ transform: rotate(90deg); }}
+  .site-name {{ font-size: 16px; font-weight: 700; }}
+  .site-probe-count {{ font-size: 13px; color: {_COLORS['dim']}; margin-left: auto; }}
+
+  /* Probe detail (nested inside site card) */
+  .probe-detail {{
+    margin: 8px 20px 16px;
+    padding: 12px 16px;
+    border-radius: 6px;
+    background: {_COLORS['bg']};
+  }}
 
   /* Results table */
   .results-table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}

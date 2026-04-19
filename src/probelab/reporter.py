@@ -19,6 +19,7 @@ STATUS_ICONS = {
     Status.DEGRADED: "[yellow]~[/yellow]",
     Status.BROKEN: "[red]\u2717[/red]",
     Status.ERROR: "[red]![/red]",
+    Status.SKIPPED: "[dim]\u2013[/dim]",
 }
 
 STATUS_COLORS = {
@@ -26,6 +27,7 @@ STATUS_COLORS = {
     Status.DEGRADED: "yellow",
     Status.BROKEN: "red",
     Status.ERROR: "red",
+    Status.SKIPPED: "dim",
 }
 
 
@@ -54,9 +56,11 @@ def print_table(results: list[ProbeResult], console: Console | None = None) -> N
 
     # Summary line
     healthy = sum(1 for r in results if r.status == Status.HEALTHY)
+    skipped = sum(1 for r in results if r.status == Status.SKIPPED)
+    tested = len(results) - skipped
     total = len(results)
-    if healthy == total:
-        console.print(f"[green]All {total} probes healthy.[/green]")
+    if healthy == tested and tested > 0:
+        console.print(f"[green]All {tested} tested probes healthy.[/green]")
     else:
         broken = sum(1 for r in results if r.status in (Status.BROKEN, Status.ERROR))
         degraded = sum(1 for r in results if r.status == Status.DEGRADED)
@@ -66,11 +70,13 @@ def print_table(results: list[ProbeResult], console: Console | None = None) -> N
         if degraded:
             parts.append(f"[yellow]{degraded} degraded[/yellow]")
         parts.append(f"[green]{healthy} healthy[/green]")
-        console.print(f"{total} probes: {', '.join(parts)}")
+        console.print(f"{tested} tested: {', '.join(parts)}")
+    if skipped:
+        console.print(f"[dim]{skipped} skipped (need browser)[/dim]")
 
     # Print diagnostic panels for non-healthy probes
     for result in results:
-        if result.status in (Status.HEALTHY,):
+        if result.status in (Status.HEALTHY, Status.SKIPPED):
             continue
         _print_diagnostics(result, console)
 
@@ -85,6 +91,7 @@ def print_json(results: list[ProbeResult]) -> None:
             "degraded": sum(1 for r in results if r.status == Status.DEGRADED),
             "broken": sum(1 for r in results if r.status == Status.BROKEN),
             "error": sum(1 for r in results if r.status == Status.ERROR),
+            "skipped": sum(1 for r in results if r.status == Status.SKIPPED),
         },
     }
     print(json.dumps(output, indent=2))

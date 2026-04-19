@@ -1,0 +1,24 @@
+name: bu-pcpartpicker
+description: "Browser Use demo: PC parts shopping on PCPartPicker"
+tags: [browser-use, ecommerce]
+
+target:
+  type: web
+  url: https://pcpartpicker.com/
+
+steps:
+  - action: goto
+    url: https://pcpartpicker.com/
+
+assertions:
+  - type: text_exists
+    text: "PCPartPicker"
+  - type: selector_exists
+    selector: "a[href='/products/']"
+  - type: selector_exists
+    selector: ".search--top input, #search_q, input[name='q']"
+  - type: selector_exists
+    selector: "nav, .navbar, #header"
+
+outputs:
+  - type: screenshot

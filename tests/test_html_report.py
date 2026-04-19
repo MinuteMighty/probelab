@@ -2,13 +2,19 @@
 
 from pathlib import Path
 
-from probelab.html_report import generate_html_report, write_html_report
+from probelab.html_report import (
+    generate_html_report,
+    write_html_report,
+    _group_by_site,
+    _extract_site,
+    _site_status,
+)
 from probelab.probe import CheckResult, ProbeResult, Status
 
 
 def _healthy_result() -> ProbeResult:
     return ProbeResult(
-        probe_name="hackernews",
+        probe_name="hackernews-top",
         url="https://news.ycombinator.com",
         status=Status.HEALTHY,
         check_results=[
@@ -16,12 +22,13 @@ def _healthy_result() -> ProbeResult:
         ],
         response_time_ms=132,
         timestamp="2026-04-12T10:00:00+00:00",
+        tags=["opencli", "hackernews"],
     )
 
 
 def _broken_result() -> ProbeResult:
     return ProbeResult(
-        probe_name="reddit-top",
+        probe_name="reddit-hot",
         url="https://reddit.com",
         status=Status.BROKEN,
         check_results=[
@@ -29,6 +36,7 @@ def _broken_result() -> ProbeResult:
         ],
         response_time_ms=891,
         timestamp="2026-04-12T10:00:00+00:00",
+        tags=["opencli", "reddit"],
         dom_diff={
             "changed": True,
             "summary": "3 element(s) removed; 2 element(s) added",
@@ -80,7 +88,53 @@ def _degraded_result() -> ProbeResult:
         schema_errors=["Item 0: 'author' is a required property"],
         response_time_ms=445,
         timestamp="2026-04-12T10:00:00+00:00",
+        tags=["opencli", "twitter"],
     )
+
+
+# ── Grouping helpers ──
+
+def test_extract_site_from_tags():
+    r = ProbeResult(probe_name="twitter-trending", url="", status=Status.HEALTHY, tags=["opencli", "twitter"])
+    assert _extract_site(r) == "twitter"
+
+
+def test_extract_site_fallback_to_name():
+    r = ProbeResult(probe_name="twitter-trending", url="", status=Status.HEALTHY, tags=[])
+    assert _extract_site(r) == "twitter"
+
+
+def test_extract_site_no_hyphen():
+    r = ProbeResult(probe_name="hackernews", url="", status=Status.HEALTHY, tags=[])
+    assert _extract_site(r) == "hackernews"
+
+
+def test_group_by_site():
+    results = [
+        ProbeResult(probe_name="twitter-trending", url="", status=Status.HEALTHY, tags=["opencli", "twitter"]),
+        ProbeResult(probe_name="twitter-search", url="", status=Status.BROKEN, tags=["opencli", "twitter"]),
+        ProbeResult(probe_name="reddit-hot", url="", status=Status.HEALTHY, tags=["opencli", "reddit"]),
+    ]
+    groups = _group_by_site(results)
+    assert len(groups) == 2
+    assert len(groups["twitter"]) == 2
+    assert len(groups["reddit"]) == 1
+
+
+def test_site_status_worst_wins():
+    results = [
+        ProbeResult(probe_name="a", url="", status=Status.HEALTHY),
+        ProbeResult(probe_name="b", url="", status=Status.BROKEN),
+    ]
+    assert _site_status(results) == Status.BROKEN
+
+
+def test_site_status_all_healthy():
+    results = [
+        ProbeResult(probe_name="a", url="", status=Status.HEALTHY),
+        ProbeResult(probe_name="b", url="", status=Status.HEALTHY),
+    ]
+    assert _site_status(results) == Status.HEALTHY
 
 
 # ── Basic generation ──
@@ -94,7 +148,7 @@ def test_generate_html_report_returns_html():
 def test_generate_html_report_contains_probe_names():
     html = generate_html_report([_healthy_result(), _broken_result()])
     assert "hackernews" in html
-    assert "reddit-top" in html
+    assert "reddit" in html
 
 
 def test_generate_html_report_contains_status():
@@ -104,16 +158,46 @@ def test_generate_html_report_contains_status():
     assert "degraded" in html
 
 
-def test_generate_html_report_summary_counts():
+def test_generate_html_report_has_site_overview():
     html = generate_html_report([_healthy_result(), _broken_result(), _degraded_result()])
-    # Summary bar should show counts
-    assert ">3<" in html  # total
-    assert ">1<" in html  # healthy/broken/degraded each = 1
+    assert "Site Overview" in html
 
 
 def test_generate_html_report_title():
     html = generate_html_report([_healthy_result()])
-    assert "<title>probelab: 1/1 healthy</title>" in html
+    assert "1/1 sites healthy" in html
+    assert "1/1 probes" in html
+
+
+# ── Site grouping in report ──
+
+def test_report_groups_by_site():
+    twitter1 = ProbeResult(probe_name="twitter-trending", url="", status=Status.HEALTHY, tags=["opencli", "twitter"])
+    twitter2 = ProbeResult(probe_name="twitter-search", url="", status=Status.BROKEN, tags=["opencli", "twitter"])
+    reddit = ProbeResult(probe_name="reddit-hot", url="", status=Status.HEALTHY, tags=["opencli", "reddit"])
+    html = generate_html_report([twitter1, twitter2, reddit])
+    # Should have site-level anchors
+    assert 'id="site-twitter"' in html
+    assert 'id="site-reddit"' in html
+
+
+def test_broken_site_open_by_default():
+    html = generate_html_report([_broken_result()])
+    assert "<details open>" in html
+
+
+def test_healthy_site_collapsed():
+    html = generate_html_report([_healthy_result()])
+    # Should NOT have <details open>
+    assert "<details open>" not in html
+    assert "<details>" in html
+
+
+def test_site_overview_shows_probe_counts():
+    twitter1 = ProbeResult(probe_name="twitter-trending", url="", status=Status.HEALTHY, tags=["opencli", "twitter"])
+    twitter2 = ProbeResult(probe_name="twitter-search", url="", status=Status.BROKEN, tags=["opencli", "twitter"])
+    html = generate_html_report([twitter1, twitter2])
+    assert "1/2 probes OK" in html
 
 
 # ── DOM diff rendering ──
@@ -142,7 +226,7 @@ def test_html_contains_repair_suggestions():
     assert "Repair Suggestions" in html
     assert "BROKEN" in html
     assert "SUGGESTED" in html
-    assert "main.feed &gt; article" in html  # HTML-escaped
+    assert "main.feed &gt; article" in html
     assert "20 matches" in html
     assert "First Post Title" in html
 
@@ -160,26 +244,20 @@ def test_html_contains_timeline_with_history():
         {
             "status": "healthy",
             "timestamp": f"2026-04-{d:02d}T10:00:00",
-            "checks": [{"selector": "tr.athing a", "match_count": 30}],
+            "checks": [{"selector": "div.post", "match_count": 30}],
         }
         for d in range(1, 6)
     ]
     html = generate_html_report(
-        [_healthy_result()],  # healthy results don't get detail cards by default
-        history_map={"hackernews": history},
-    )
-    # Timeline only renders for non-healthy probes, so check broken
-    html_broken = generate_html_report(
         [_broken_result()],
-        history_map={"reddit-top": history},
+        history_map={"reddit-hot": history},
     )
-    assert "Timeline" in html_broken
-    assert "<svg" in html_broken  # SVG sparkline
+    assert "Timeline" in html
+    assert "<svg" in html
 
 
 def test_html_no_timeline_without_history():
     html = generate_html_report([_broken_result()], history_map={})
-    # Should still render DOM diff etc, just no timeline
     assert "DOM Changes" in html
 
 
@@ -190,7 +268,7 @@ def test_html_sparkline_has_svg_elements():
         {"status": "healthy", "timestamp": "2026-04-01", "checks": [{"selector": "a", "match_count": v}]}
         for v in [30, 28, 32, 25, 5, 0]
     ]
-    html = generate_html_report([_broken_result()], history_map={"reddit-top": history})
+    html = generate_html_report([_broken_result()], history_map={"reddit-hot": history})
     assert "<polyline" in html
     assert "<circle" in html
     assert "<polygon" in html
@@ -204,7 +282,7 @@ def test_write_html_report(tmp_path):
     content = path.read_text()
     assert "<!DOCTYPE html>" in content
     assert "hackernews" in content
-    assert "reddit-top" in content
+    assert "reddit" in content
 
 
 # ── Healthy-only report (no detail cards) ──
@@ -212,7 +290,6 @@ def test_write_html_report(tmp_path):
 def test_healthy_only_report_is_clean():
     html = generate_html_report([_healthy_result()])
     assert "hackernews" in html
-    # Should NOT have a detail card for healthy probes
     assert "DOM Changes" not in html
     assert "Repair Suggestions" not in html
 

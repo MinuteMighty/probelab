@@ -1,0 +1,61 @@
+name: hackernews-nav
+description: |
+  Verify Hacker News two-click navigation works end-to-end.
+  Home -> click "new" (goes to /newest) -> click "past" (goes to /front).
+  Forces browser mode (the engine only launches Playwright when a probe
+  contains click/type/wait_* steps). A successful run proves:
+    1. Playwright Chromium launched
+    2. First click triggered a page navigation
+    3. Second click triggered another page navigation
+    4. Final URL lands on /front, so both clicks fired in order
+
+target:
+  type: web
+  url: https://news.ycombinator.com/
+
+steps:
+  # 1. Land on the home page.
+  - action: goto
+    url: https://news.ycombinator.com/
+    timeout_ms: 15000
+
+  # 2. Click "new" in the top nav. Scoped to span.pagetop so it doesn't
+  #    collide with any other a[href='newest'] elsewhere on the page.
+  - action: click
+    selector: "span.pagetop a[href='newest']"
+    timeout_ms: 5000
+
+  # 3. Prove the navigation to /newest completed — if the click didn't
+  #    navigate, the story rows wouldn't re-render and this would time out.
+  - action: wait_for_selector
+    selector: "span.titleline > a"
+    timeout_ms: 10000
+
+  # 4. Click "past" from /newest — this is a different page than home, so
+  #    the probe only reaches /front if step 2's navigation truly happened.
+  - action: click
+    selector: "span.pagetop a[href='front']"
+    timeout_ms: 5000
+
+  # 5. Confirm /front loaded.
+  - action: wait_for_selector
+    selector: "span.titleline > a"
+    timeout_ms: 10000
+
+assertions:
+  # The killer assertion — only passes if BOTH clicks triggered navigation.
+  - type: url_matches
+    pattern: "/front"
+
+  # The /front page is a real HN listing with >= 10 stories.
+  - type: selector_count
+    selector: "span.titleline > a"
+    min: 10
+
+  # Sanity: we're still on HN (catches wrong-domain redirects).
+  - type: text_exists
+    text: "Hacker News"
+
+outputs:
+  - type: screenshot
+  - type: html

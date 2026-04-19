@@ -12,6 +12,7 @@ class Status(str, Enum):
     DEGRADED = "degraded"
     BROKEN = "broken"
     ERROR = "error"
+    SKIPPED = "skipped"
 
 
 @dataclass
@@ -121,6 +122,7 @@ class ProbeResult:
     dom_diff: dict[str, Any] | None = None
     drift_alerts: list[dict[str, Any]] = field(default_factory=list)
     repair_suggestions: list[dict[str, Any]] = field(default_factory=list)
+    tags: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize for JSON output."""
@@ -149,4 +151,6 @@ class ProbeResult:
             result["drift_alerts"] = self.drift_alerts
         if self.repair_suggestions:
             result["repair_suggestions"] = self.repair_suggestions
+        if self.tags:
+            result["tags"] = self.tags
         return result

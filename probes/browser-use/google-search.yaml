@@ -1,0 +1,27 @@
+name: bu-google-search
+description: "Browser Use common task: Google search results page"
+tags: [browser-use, google]
+
+target:
+  type: web
+  url: https://www.google.com/search?q=browser+use+ai+agent
+
+steps:
+  - action: goto
+    url: https://www.google.com/search?q=browser+use+ai+agent
+
+assertions:
+  - type: selector_exists
+    selector: "#search"
+  - type: selector_exists
+    selector: "div.g"
+  - type: selector_count
+    selector: "div.g"
+    min: 3
+  - type: selector_exists
+    selector: "a h3"
+  - type: selector_exists
+    selector: "#searchform"
+
+outputs:
+  - type: screenshot

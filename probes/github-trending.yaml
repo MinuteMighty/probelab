@@ -1,0 +1,22 @@
+name: github-trending
+description: Verify GitHub Trending page loads with repository list
+
+target:
+  type: web
+  url: https://github.com/trending
+
+steps:
+  - action: goto
+    url: https://github.com/trending
+
+assertions:
+  - type: text_exists
+    text: "Trending"
+  - type: selector_exists
+    selector: "article.Box-row"
+  - type: selector_count
+    selector: "article.Box-row"
+    min: 5
+
+outputs:
+  - type: screenshot

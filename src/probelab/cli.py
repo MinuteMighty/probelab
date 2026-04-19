@@ -98,12 +98,25 @@ def check(name: str | None, fmt: str, html_path: str | None, strict: bool, exit_
             console.print("[yellow]No probes configured. Run 'probelab init' to create one.[/yellow]")
             return
 
+    from probelab.runner import browser_available
+    browser_probes = sum(1 for p in probes if p.browser)
+    if browser_probes:
+        if not browser_available():
+            console.print(f"[dim]{browser_probes} probe(s) need browser — install with:[/dim] pip install probelab[browser]")
+        else:
+            from probelab.browser import check_cdp_available
+            if check_cdp_available():
+                console.print(f"[green]Chrome CDP detected[/green] — {browser_probes} browser probe(s) will use your real Chrome")
+            else:
+                console.print(f"[yellow]{browser_probes} browser probe(s) will use headless mode[/yellow]")
+                console.print(f"[dim]For best results, start Chrome with: --remote-debugging-port=9222[/dim]")
     console.print(f"Running {len(probes)} probe(s)...\n")
     results = run_all_probes(probes)
 
-    # Save results to history
+    # Save results to history (skip probes that weren't actually tested)
     for result in results:
-        save_history(result.probe_name, result.to_dict())
+        if result.status.value != "skipped":
+            save_history(result.probe_name, result.to_dict())
 
     if fmt == "json":
         print_json(results)
@@ -330,6 +343,82 @@ def diff(name: str) -> None:
         console.print(f"[bold]Current snapshot for {name}[/bold]")
         console.print(f"  Hash: {snapshot.get('hash', '?')}")
         console.print(f"  No previous diff available — run 'probelab check' after a site change.")
+
+
+@main.command("import-opencli")
+@click.argument("path", type=click.Path(exists=True, file_okay=False))
+@click.option("--dry-run", is_flag=True, help="Show what would be imported without saving")
+@click.option("--force", is_flag=True, help="Overwrite existing probes with the same name")
+@click.option("--tag", "extra_tags", multiple=True, help="Additional tags for imported probes")
+def import_opencli_cmd(path: str, dry_run: bool, force: bool, extra_tags: tuple[str, ...]) -> None:
+    """Import probe definitions from an opencli repository.
+
+    Scans the given PATH for opencli adapter files, extracts CSS
+    selectors and URLs, and generates probelab probes.
+
+    Example:
+
+        probelab import-opencli ~/code/opencli
+        probelab import-opencli ./opencli --dry-run
+    """
+    from pathlib import Path as P
+
+    from probelab.opencli import import_opencli, scan_opencli_dir, adapters_to_probes
+
+    opencli_path = P(path)
+
+    if dry_run:
+        adapters = scan_opencli_dir(opencli_path)
+        if not adapters:
+            console.print("[yellow]No adapters found in this directory.[/yellow]")
+            return
+
+        probes, skipped = adapters_to_probes(adapters)
+
+        from rich.table import Table
+
+        table = Table(title=f"Dry Run: {len(probes)} probe(s) from {len(adapters)} adapter(s)")
+        table.add_column("Probe Name", style="bold")
+        table.add_column("URL")
+        table.add_column("Selectors", justify="right")
+        table.add_column("Browser")
+        table.add_column("Tags")
+
+        for probe in probes:
+            table.add_row(
+                probe.name,
+                probe.url[:60] + "..." if len(probe.url) > 60 else probe.url,
+                str(len(probe.checks)),
+                "yes" if probe.browser else "no",
+                ", ".join(probe.tags),
+            )
+
+        console.print(table)
+
+        if skipped:
+            console.print(f"\n[yellow]Skipped {len(skipped)}:[/yellow]")
+            for name, reason in skipped:
+                console.print(f"  {name}: {reason}")
+        return
+
+    result = import_opencli(
+        opencli_path,
+        force=force,
+        extra_tags=list(extra_tags) if extra_tags else None,
+    )
+
+    console.print(f"\n[bold]Import complete[/bold]")
+    console.print(f"  Adapters found:  {result.adapters_found}")
+    console.print(f"  Probes created:  [green]{result.probes_created}[/green]")
+
+    if result.skipped:
+        console.print(f"  Skipped:         [yellow]{len(result.skipped)}[/yellow]")
+        for name, reason in result.skipped:
+            console.print(f"    {name}: {reason}")
+
+    if result.created_paths:
+        console.print(f"\n[green]Probes saved to .probelab/probes/[/green]")
+        console.print(f"Run 'probelab check' to test them.")
 
 
 if __name__ == "__main__":

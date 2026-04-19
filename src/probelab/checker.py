@@ -14,7 +14,21 @@ def validate_checks(tree: HTMLParser, checks: list[Check]) -> list[CheckResult]:
     """Run all selector checks against a parsed HTML tree."""
     results = []
     for check in checks:
-        nodes = tree.css(check.selector)
+        try:
+            nodes = tree.css(check.selector)
+        except ValueError:
+            # Invalid CSS selector — treat as zero matches
+            results.append(
+                CheckResult(
+                    selector=check.selector,
+                    match_count=0,
+                    expected_min=check.expect_min,
+                    expected_max=check.expect_max,
+                    passed=False,
+                    extracted=[],
+                )
+            )
+            continue
         count = len(nodes)
 
         passed = count >= check.expect_min

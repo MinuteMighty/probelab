@@ -1,0 +1,28 @@
+name: zhihu-cdp
+description: Check Zhihu answer page (requires Chrome CDP with logged-in session)
+browser: true
+
+target:
+  type: web
+  url: https://www.zhihu.com/
+
+steps:
+  - action: goto
+    url: https://www.zhihu.com/
+  - action: wait_for_text
+    text: "知乎"
+    timeout_ms: 10000
+
+assertions:
+  # Semantic selectors (survived Zhihu redesign per CDP audit)
+  - type: selector_exists
+    selector: "[itemprop='name']"
+  - type: selector_exists
+    selector: "a[href*='/question/']"
+  # CSS class selectors (died in redesign — test to prove the point)
+  - type: selector_exists
+    selector: ".Post-Title"
+
+outputs:
+  - type: screenshot
+  - type: html

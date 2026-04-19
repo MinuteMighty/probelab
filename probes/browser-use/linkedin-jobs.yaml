@@ -1,0 +1,24 @@
+name: bu-linkedin-jobs
+description: "Browser Use common task: LinkedIn job search"
+tags: [browser-use, jobs, linkedin]
+
+target:
+  type: web
+  url: https://www.linkedin.com/jobs/search/?keywords=AI+engineer
+
+steps:
+  - action: goto
+    url: https://www.linkedin.com/jobs/search/?keywords=AI+engineer
+
+assertions:
+  - type: text_exists
+    text: "jobs"
+  - type: selector_exists
+    selector: ".jobs-search__results-list, .scaffold-layout__list"
+  - type: selector_exists
+    selector: ".base-card, .job-card-container"
+  - type: selector_exists
+    selector: "input[aria-label*='Search'], input[id*='jobs-search']"
+
+outputs:
+  - type: screenshot

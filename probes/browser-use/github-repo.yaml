@@ -1,0 +1,26 @@
+name: bu-github-repo
+description: "Browser Use demo: find stars of a GitHub repo"
+tags: [browser-use, github]
+
+target:
+  type: web
+  url: https://github.com/browser-use/browser-use
+
+steps:
+  - action: goto
+    url: https://github.com/browser-use/browser-use
+
+assertions:
+  - type: text_exists
+    text: "browser-use"
+  - type: selector_exists
+    selector: "#repo-stars-counter-star"
+  - type: selector_exists
+    selector: "a[href='/browser-use/browser-use/stargazers']"
+  - type: selector_exists
+    selector: "article.markdown-body"
+  - type: selector_exists
+    selector: "[data-testid='latest-commit']"
+
+outputs:
+  - type: screenshot

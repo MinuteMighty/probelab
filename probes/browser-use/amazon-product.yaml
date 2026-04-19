@@ -1,0 +1,27 @@
+name: bu-amazon-product
+description: "Common agent task: Amazon product page extraction"
+tags: [browser-use, ecommerce, amazon]
+
+target:
+  type: web
+  url: https://www.amazon.com/dp/B0D1XD1ZV3
+
+steps:
+  - action: goto
+    url: https://www.amazon.com/dp/B0D1XD1ZV3
+
+assertions:
+  - type: selector_exists
+    selector: "#productTitle"
+  - type: selector_exists
+    selector: ".a-price .a-offscreen"
+  - type: selector_exists
+    selector: "#acrPopover, [data-hook='rating-out-of-text']"
+  - type: selector_exists
+    selector: "#add-to-cart-button"
+  - type: selector_exists
+    selector: "#imgTagWrapperId img, #landingImage"
+
+outputs:
+  - type: screenshot
+  - type: html

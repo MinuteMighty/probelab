@@ -1,0 +1,29 @@
+name: bu-wikipedia
+description: "Common agent task: Wikipedia article extraction"
+tags: [browser-use, reference]
+
+target:
+  type: web
+  url: https://en.wikipedia.org/wiki/Web_scraping
+
+steps:
+  - action: goto
+    url: https://en.wikipedia.org/wiki/Web_scraping
+
+assertions:
+  - type: selector_exists
+    selector: "#firstHeading"
+  - type: selector_exists
+    selector: "#mw-content-text"
+  - type: selector_exists
+    selector: ".mw-parser-output p"
+  - type: selector_count
+    selector: ".mw-parser-output p"
+    min: 5
+  - type: selector_exists
+    selector: "#toc, .toc, .mw-table-of-contents-container"
+  - type: selector_exists
+    selector: ".infobox, .sidebar, .mw-parser-output table"
+
+outputs:
+  - type: screenshot

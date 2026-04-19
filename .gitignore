@@ -8,9 +8,11 @@ build/
 *.egg
 .venv/
 venv/
-.probelab/snapshots/
-.probelab/history/
+.probelab/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .DS_Store
+discovery/
+launch/
+opencli-report.html
