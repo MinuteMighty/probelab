@@ -48,8 +48,7 @@ dev = [
 ]
 
 [project.scripts]
-probelab = "probelab.cli_v1:main"
-probelab-legacy = "probelab.cli:main"
+probelab = "probelab.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/MinuteMighty/probelab"

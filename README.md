@@ -1,268 +1,215 @@
 # probelab
 
-**Browser automation health monitoring. Private-first. Self-diagnosing.**
+**Find out what your code depends on. Know when it breaks.**
 
-Write a probe in YAML. probelab runs it, tells you if it passed or failed, and tells you _why_ it failed. Auth expired? Selector gone? CAPTCHA? DOM changed? You'll know in one command.
+Your project depends on external web pages and APIs — for data, for links, for services. When they break, you find out from your users. probelab finds out first.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 
 ---
 
-## Why
-
-Every browser automation, web scraper, and CLI adapter depends on the target page staying the same. It never does.
-
-- CSS classes get renamed. Selectors return 0 matches.
-- Login sessions expire. The page silently redirects to `/signin`.
-- Cloudflare throws a CAPTCHA. Your script sees an empty page.
-- The site redesigns. Everything breaks at once.
-
-We tested 5 OpenCLI adapters that were **less than one week old**. 67% of their selectors were already broken. ([Full audit](innoforge-projects/probelab/opencli-adapter-audit.md))
-
-**probelab catches these failures, classifies them, and tells you exactly what to do.**
-
-## Quick Start
+## Two commands
 
 ```bash
 pip install probelab
-probelab init
-probelab check
+probelab scan
 ```
 
-That's it. probelab creates an example probe and runs it:
-
 ```
-  ✓  hackernews       healthy     279ms
+  Scanning my-project/ ...
+
+  Found 6 external dependencies:
+
+  API Dependencies (2)
+  Provider    Source               Env Key
+  openai      src/ai.py:3         OPENAI_API_KEY
+  stripe      src/billing.py:1    STRIPE_SECRET_KEY
+
+  Web Dependencies (4)
+  URL                             Source                    Selectors
+  competitor.com/pricing          src/scraper.py:23         .price-card
+  docs.stripe.com/api/charges     lib/api_check.py:8       -
+  status.aws.com                  .github/workflows/ci.yml -
+  myapp.com/health                scripts/deploy.sh:3      -
+
+  6 probes ready to generate.
+  Run: probelab scan --accept
 ```
 
-## Write your own probe
+probelab scans your code and finds every external thing it depends on — URLs in your Python, JavaScript, shell scripts, CI files, config, and docs. API SDKs like OpenAI, Stripe, Anthropic, Replicate, Gemini. CSS selectors in your scraping code. Health check URLs in your CI.
 
-Probes are YAML files. A probe says: go to this URL, check these conditions.
+Then it generates monitoring probes for each one. Run `probelab check` daily, and you'll know something broke before your users do.
+
+## The problem (you've had this)
+
+- Your script pulls prices from a competitor's page. They redesigned. Your script returns empty data for three days before you notice.
+- Your app uses the OpenAI API. They deprecate a model. Your calls start failing at 2am.
+- Your README links to external docs. They restructured the site. Links are 404s. A user files an issue.
+- Your CI health check curls an endpoint. The endpoint moves. Your deploy passes but the app is broken.
+
+**In every case: nothing tells you. You find out from users, from blank data, from angry Slack messages.**
+
+## Example: monitor your docs site
 
 ```yaml
-name: hackernews
-description: Verify HN front page loads and has stories
+name: my-docs
+description: Make sure the install guide still exists
 
 target:
   type: web
-  url: https://news.ycombinator.com/
-
-steps:
-  - action: goto
-    url: https://news.ycombinator.com/
+  url: https://docs.myproject.com/install
 
 assertions:
   - type: text_exists
-    text: "Hacker News"
+    text: "pip install"
   - type: selector_exists
-    selector: "span.titleline > a"
+    selector: "code"
   - type: selector_count
-    selector: "span.titleline > a"
-    min: 10
-
-outputs:
-  - type: screenshot
-  - type: html
+    selector: "h2"
+    min: 3
 ```
 
-Save it to `~/.probelab/probes/myprobe.yaml` and run `probelab check`.
+This says: "The install page should contain 'pip install', should have `<code>` blocks, and should have at least 3 section headings."
 
-## What failure classification looks like
+Save it to `~/.probelab/probes/my-docs.yaml`. Run `probelab check`. Done.
+
+## Example: monitor a competitor's pricing page
+
+```yaml
+name: competitor-pricing
+description: Track if competitor changes pricing tiers
+
+target:
+  type: web
+  url: https://competitor.com/pricing
+
+assertions:
+  - type: text_exists
+    text: "Free"
+  - type: text_exists
+    text: "Enterprise"
+  - type: selector_count
+    selector: ".pricing-card"
+    min: 3
+```
+
+If they drop the free tier or add a new plan, you'll know immediately.
+
+## Example: monitor a job board
+
+```yaml
+name: company-jobs
+description: Alert when new engineering roles posted
+
+target:
+  type: web
+  url: https://dream-company.com/careers
+
+assertions:
+  - type: selector_exists
+    selector: ".job-listing"
+  - type: text_exists
+    text: "Engineering"
+```
+
+## What happens when something breaks
 
 probelab doesn't just say "it broke." It tells you _why_:
 
 ```
 $ probelab check
 
-  Probe             Status     Duration   Failure
-  ────────────────   ────────   ────────   ──────────────
-  hackernews         healthy       579ms
-  github-trending    healthy      1374ms
-  zhihu-cdp          broken       2692ms   auth_expired
+  Probe               Status     Duration   Failure
+  ──────────────────   ────────   ────────   ──────────────
+  my-docs              healthy       312ms
+  competitor-pricing   broken        891ms   selector_missing
+  company-jobs         healthy       445ms
 
   2 healthy | 1 broken / 3 total
 ```
 
 ```
-$ probelab check probes/zhihu-cdp.yaml --verbose
+$ probelab check --verbose
 
-  zhihu-cdp broken
-    URL: https://www.zhihu.com/
-    Duration: 4624ms
-
-    Steps
-      ✓ goto (2361ms)
-      ✓ wait_for_text (10ms)
+  competitor-pricing broken
+    URL: https://competitor.com/pricing
+    Duration: 891ms
 
     Assertions
-      ✗ selector_exists [itemprop='name'] = 0 matches
-      ✗ selector_exists a[href*='/question/'] = 0 matches
-      ✗ selector_exists .Post-Title = 0 matches
+      ✓ text_exists "Free"
+      ✓ text_exists "Enterprise"
+      ✗ selector_count .pricing-card >= 3 → got 0
 
-  ╭─────────────────────── Failure ────────────────────────╮
-  │ auth_expired                                           │
-  │ Redirected to login page:                              │
-  │ https://www.zhihu.com/signin?next=%2F.                 │
-  │ Re-login in Chrome.                                    │
-  ╰────────────────────────────────────────────────────────╯
+  ╭───────────────────── Failure ──────────────────────╮
+  │ selector_missing                                   │
+  │ Selector '.pricing-card' not found (0 matches).    │
+  │ The page may have been redesigned.                 │
+  │ Run: probelab diagnose competitor-pricing           │
+  ╰────────────────────────────────────────────────────╯
 ```
 
 ### 9 failure categories
 
-| Category | What it means | What to do |
+probelab classifies every failure so you know what action to take:
+
+| You see | It means | Do this |
 |---|---|---|
-| `auth_expired` | Page redirected to login, or login form detected | Re-login in Chrome, re-run with `--cdp` |
-| `captcha_detected` | CAPTCHA or bot challenge on page | Open the URL manually, solve it |
-| `selector_missing` | CSS selector returns 0 matches | Run `probelab diagnose` for repair suggestions |
-| `text_missing` | Expected text not found on page | Check if the site changed its copy |
+| `selector_missing` | A CSS element is gone | Run `probelab diagnose` for fix suggestions |
+| `text_missing` | Expected text not on page | Check if the site changed its copy |
+| `navigation_error` | DNS failure, HTTP error, site down | Wait and retry, or check the URL |
+| `timeout` | Page too slow or element doesn't exist | Increase timeout or check element |
+| `auth_expired` | Redirected to login page | Re-login in browser (see CDP mode below) |
+| `captcha_detected` | Bot challenge detected | Open URL manually, solve it |
 | `url_mismatch` | URL doesn't match expected pattern | Check for redirects |
-| `timeout` | Step or assertion timed out | Page may be slow or element may not exist |
-| `navigation_error` | DNS failure, HTTP error, connection refused | Site may be down |
 | `page_changed` | DOM structure changed from baseline | Run `probelab diff` to see what changed |
-| `unexpected_redirect` | Redirected to a different domain | May be malicious or a CDN change |
+| `unexpected_redirect` | Redirected to different domain | Check for CDN or config changes |
 
-## Authenticated sites (CDP mode)
+## Diagnose and fix
 
-probelab can connect to your running Chrome via CDP to use your real login sessions:
-
-```bash
-# 1. Launch Chrome with remote debugging
-/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222
-
-# 2. Run probes with your login state
-probelab check probes/zhihu-cdp.yaml --cdp ws://localhost:9222
-```
-
-This uses your real cookies, your real browser fingerprint. Sites can't tell it apart from you browsing manually.
-
-## Diagnose and repair
-
-When a selector breaks, probelab suggests replacements:
+When a selector breaks, probelab analyzes the current page and suggests replacements:
 
 ```
-$ probelab diagnose zhihu-cdp
+$ probelab diagnose competitor-pricing
 
-  zhihu-cdp -- broken
+  competitor-pricing -- broken
     Category: selector_missing
-    Message: Selector '.Post-Title' not found (0 matches). DOM may have changed.
+    Message: Selector '.pricing-card' not found (0 matches).
 
   Suggested replacements:
-    1. [itemprop="name"]         -> 1 match  (confidence: 82%)
-       Semantic attribute selector (survives redesigns)
-    2. h1[class*="Title"]       -> 1 match  (confidence: 45%)
-       Partial class match
-    3. h1                        -> 3 matches (confidence: 12%)
-       Tag-only fallback
+    1. .plan-tier            -> 3 matches (confidence: 78%)
+       Fuzzy class match: '.pricing-card' → '.plan-tier'
+    2. [data-testid="plan"]  -> 3 matches (confidence: 62%)
+       Semantic attribute selector
+    3. article.plan          -> 3 matches (confidence: 41%)
+       Structural match
 ```
 
-Five repair strategies:
-1. **Class relaxation** -- drop one class at a time
-2. **Fuzzy class matching** -- catch renames (`story-link` -> `storyLink`)
-3. **Parent simplification** -- try the leaf selector alone
-4. **Attribute-based selectors** -- suggest `[data-testid]`, `[itemprop]`, `[role]`
-5. **Structural similarity** -- find groups of sibling elements
+Update your YAML with the new selector. Run `probelab check` again. Fixed.
 
-## Baseline comparison
+## Compare against baseline
 
-probelab saves successful runs as baselines. When things change:
+probelab saves every successful run. When a check fails, compare against the last good state:
 
 ```
-$ probelab diff hackernews
+$ probelab diff competitor-pricing
 
   Baseline: 2026-04-15 (healthy)
-  Current:  2026-04-16 (broken)
+  Current:  2026-04-19 (broken)
 
   Changes:
-    - span.titleline > a: was 30 matches, now 0
-    - url redirected from / to /signin
-  
-  Classification: auth_expired
+    - .pricing-card: was 3 matches, now 0
+    - New element appeared: .plan-tier
 ```
 
-## Security guardrails
-
-probelab includes safety checks that run _during_ execution, not after:
-
-- **Domain allowlist** -- probes can only navigate to domains declared in target/steps
-- **Redirect anomaly detection** -- flags unexpected domain changes mid-execution
-- **Prompt injection scanning** -- detects "ignore previous instructions" patterns in page content
-- **Hidden element detection** -- flags hidden iframes and invisible action elements
-
-These protect you when probing untrusted pages, and prepare for future LLM-powered features (diagnose, heal) where page content could mislead an AI agent.
-
-## Commands
-
-| Command | Description |
-|---|---|
-| `probelab init` | Create `~/.probelab/` directory with example probe |
-| `probelab check [probe.yaml]` | Run one probe, or all probes if no argument |
-| `probelab check --json` | JSON output (for CI pipelines) |
-| `probelab check --verbose` | Detailed step-by-step results |
-| `probelab check --cdp ws://...` | Use Chrome CDP for authenticated sites |
-| `probelab show <name>` | Show last run result |
-| `probelab diff <name>` | Compare latest run vs last healthy baseline |
-| `probelab diagnose <name>` | Failure analysis + selector repair suggestions |
-
-## Probe YAML reference
-
-### Actions (steps)
-
-| Action | Parameters | Description |
-|---|---|---|
-| `goto` | `url` | Navigate to URL |
-| `click` | `selector` | Click an element |
-| `type` | `selector`, `value` | Type text into an input |
-| `wait_for_selector` | `selector`, `timeout_ms` | Wait for element to appear |
-| `wait_for_text` | `text`, `timeout_ms` | Wait for text on page |
-
-### Assertions
-
-| Type | Parameters | Description |
-|---|---|---|
-| `selector_exists` | `selector` | Element exists (>= 1 match) |
-| `selector_count` | `selector`, `min`, `max` | Match count in range |
-| `text_exists` | `text` | Text appears on page |
-| `url_matches` | `pattern` | Current URL matches regex |
-
-### Outputs
-
-| Type | Description |
-|---|---|
-| `screenshot` | Full-page PNG screenshot |
-| `html` | Page HTML snapshot |
-
-## Data storage
-
-Everything stays on your machine. No cloud. No telemetry.
-
-```
-~/.probelab/
-  probes/              # your probe definitions (YAML)
-  runs/                # execution results + artifacts
-    2026-04-15/
-      hackernews/
-        result.json
-        screenshot.png
-        page.html
-  baselines/           # last known good state per probe
-  history/             # run history (JSONL, one file per probe)
-```
-
-## CI/CD
-
-```bash
-probelab check --json
-# Exit 0 = all healthy
-# Exit 1 = any broken or error
-```
+## Put it in CI
 
 ```yaml
-# .github/workflows/probes.yml
-name: Probe Health
+# .github/workflows/web-contracts.yml
+name: Web Contracts
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 8 * * *'   # every morning
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -270,64 +217,99 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.13'
+          python-version: '3.12'
       - run: pip install probelab
       - run: probelab check --json
 ```
 
-## Import probes from OpenCLI
+Commit your probe YAML files to the repo. CI runs them daily. If anything breaks, the job fails.
 
-If you use [OpenCLI](https://github.com/jackwener/OpenCLI), probelab can import its adapters as probes:
+## Advanced: pages that need login (CDP mode)
+
+Some pages require authentication. probelab can use your real Chrome browser session:
 
 ```bash
-probelab-legacy import-opencli ~/OpenCLI/clis/
-probelab check
+# Start Chrome with debugging
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222
+
+# Run probes using your login cookies
+probelab check --cdp ws://localhost:9222
 ```
 
-This scans OpenCLI's adapter directory, extracts CSS selectors and URLs, and generates probe YAML files. The core probelab system is adapter-format-agnostic -- it only reads its own Probe YAML.
+No passwords stored. No tokens leaked. It uses your actual browser session.
 
-## Use cases
+## Advanced: import from OpenCLI
 
-- **Adapter fleet monitoring** -- detect when adapters break across any framework
-- **Internal tool health** -- check if your admin dashboard still works after deploys
-- **Scraper maintenance** -- catch selector breakage before your data pipeline produces garbage
-- **CI/CD gates** -- fail builds when external page structure changes
-- **Pre-deploy checks** -- verify staging has the expected elements before shipping
+If you use [OpenCLI](https://github.com/jackwener/opencli), import its adapters as probes:
 
-### Works with any adapter ecosystem
+```bash
+probelab import-opencli ~/code/opencli
+```
 
-probelab monitors the PAGE, not the adapter code. Write a probe for any site your automation targets:
+## All commands
 
-| Ecosystem | How to use probelab |
+| Command | What it does |
 |---|---|
-| [OpenCLI](https://github.com/jackwener/OpenCLI) | `probelab-legacy import-opencli` auto-generates probes from adapters |
-| [agent-browser](https://github.com/vercel-labs/agent-browser) | Write probes for the sites your agent-browser scripts target |
-| [Browser Use](https://github.com/browser-use/browser-use) / [Workflow Use](https://github.com/browser-use/workflow-use) | Write probes to monitor pages your cached workflows depend on |
-| [bb-browser](https://github.com/epiral/bb-browser) | Write probes for the 36 platforms bb-browser supports |
-| [Stagehand](https://github.com/browserbase/stagehand) | Write probes to validate selectors Stagehand caches |
-| Playwright / Puppeteer scripts | Write probes for the selectors your scripts use |
-| Custom scrapers | Write probes for any page with any selectors |
+| `probelab scan [path]` | **Scan your project for external dependencies** |
+| `probelab scan --accept` | Scan and write probe files immediately |
+| `probelab init` | Create example probe (manual setup) |
+| `probelab check` | Run all probes |
+| `probelab check myprobe.yaml` | Run one probe |
+| `probelab check --verbose` | Show step-by-step details |
+| `probelab check --json` | JSON output for CI |
+| `probelab show <name>` | Show last result |
+| `probelab diff <name>` | Compare against last healthy run |
+| `probelab diagnose <name>` | Failure analysis + fix suggestions |
+| `probelab import-opencli <path>` | Import OpenCLI adapters |
 
-probelab doesn't read or parse adapter code. It checks whether the page still has the elements your automation expects. The probe YAML is the universal format.
+## Probe YAML reference
 
-## What's coming
+```yaml
+name: my-probe                        # unique name
+description: What this checks         # for humans
 
+target:
+  type: web
+  url: https://example.com/page       # URL to check
+
+steps:                                 # optional: browser actions
+  - action: goto
+    url: https://example.com/page
+  - action: wait_for_text
+    text: "Welcome"
+
+assertions:                            # what must be true
+  - type: text_exists
+    text: "some text"
+  - type: selector_exists
+    selector: ".my-element"
+  - type: selector_count
+    selector: "li.item"
+    min: 5
+  - type: url_matches
+    pattern: "example\\.com/page"
+
+outputs:                               # optional: save artifacts
+  - type: screenshot
+  - type: html                         # needed for 'diagnose'
 ```
-v1.0  (current)  Health monitoring + failure classification + diagnose
-v1.1             HTML report dashboard (sparklines, health trails)
-v1.2             Statistical baseline drift detection (sigma-based alerts)
-v1.3             CLI/API probe types (not just web)
-v2.0             Team registry (sync probes via private Git repo)
+
+## Install
+
+```bash
+pip install probelab            # core (HTTP checks)
+pip install probelab[browser]   # + browser for JS-rendered pages and CDP
 ```
+
+Python 3.11+.
 
 ## Contributing
 
 ```bash
 git clone https://github.com/MinuteMighty/probelab.git
 cd probelab
-pip install -e ".[dev,browser]"
-playwright install chromium
-python -m pytest tests/ -v
+pip install -e ".[dev]"
+python -m pytest tests/ -v   # 184 tests
 ```
 
 ## License

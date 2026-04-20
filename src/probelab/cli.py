@@ -1,371 +1,324 @@
-"""CLI commands — the main user interface for probelab."""
+"""Probelab CLI — browser automation health monitoring.
+
+Commands:
+    probelab init                       Create ~/.probelab/ + example probe
+    probelab check [probe.yaml]         Run one or all probes
+    probelab show <name>                Show last run result
+    probelab diff <name>                Compare latest vs baseline
+    probelab diagnose <name>            Failure analysis + repair suggestions
+    probelab import-opencli <path>      Import probes from opencli adapters
+"""
 
 from __future__ import annotations
 
-import sys
+import time
+from pathlib import Path
+from typing import Optional
 
-import click
+import httpx
+import typer
 from rich.console import Console
 
-from probelab import __version__
-from probelab.config import (
-    ensure_dirs,
-    load_all_probes,
-    load_history,
-    load_probe,
-    remove_probe,
-    save_history,
-    save_probe,
-    PROBES_DIR,
+app = typer.Typer(
+    name="probelab",
+    help="Browser automation health monitoring CLI.",
+    no_args_is_help=True,
 )
-from probelab.probe import Check, Probe
-from probelab.reporter import print_json, print_table
-from probelab.runner import run_all_probes, run_probe
-
 console = Console()
 
-
-@click.group()
-@click.version_option(version=__version__, prog_name="probelab")
-def main() -> None:
-    """probelab — Monitor web contracts. Detect drift. Diagnose and repair."""
+# Default paths
+HOME = Path.home() / ".probelab"
+PROBES_DIR = HOME / "probes"
 
 
-@main.command()
-@click.argument("name")
-@click.option("--url", required=True, help="Target URL to probe")
-@click.option("--select", "selectors", multiple=True, help="CSS selector(s) to check")
-@click.option("--expect-min", type=int, default=1, help="Minimum expected matches per selector")
-@click.option("--expect-max", type=int, default=None, help="Maximum expected matches")
-@click.option("--timeout", type=int, default=15, help="Request timeout in seconds")
-@click.option("--tag", "tags", multiple=True, help="Tags for organizing probes")
-def init(
-    name: str,
-    url: str,
-    selectors: tuple[str, ...],
-    expect_min: int,
-    expect_max: int | None,
-    timeout: int,
-    tags: tuple[str, ...],
-) -> None:
-    """Create a new probe definition.
+@app.command()
+def init():
+    """Create ~/.probelab/ directory with an example probe."""
+    from probelab.io.store import ensure_dirs
+    from probelab.io.loader import save_probe_yaml
+    from probelab.models.probe import Probe, Target, Step, Assertion, OutputSpec
 
-    Example:
+    ensure_dirs(HOME)
 
-        probelab init hackernews --url https://news.ycombinator.com \\
-            --select "tr.athing .titleline > a" --expect-min 20
-    """
-    checks = [
-        Check(selector=s, expect_min=expect_min, expect_max=expect_max)
-        for s in selectors
-    ]
-
-    probe = Probe(
-        name=name,
-        url=url,
-        checks=checks,
-        timeout=timeout,
-        tags=list(tags),
+    # Create example probe
+    example = Probe(
+        name="hackernews",
+        description="Verify Hacker News loads and has stories",
+        target=Target(type="web", url="https://news.ycombinator.com/"),
+        steps=[
+            Step(action="goto", url="https://news.ycombinator.com/"),
+        ],
+        assertions=[
+            Assertion(type="text_exists", text="Hacker News"),
+            Assertion(type="selector_exists", selector="span.titleline > a"),
+            Assertion(type="selector_count", selector="span.titleline > a", min=10),
+        ],
+        outputs=[
+            OutputSpec(type="screenshot"),
+            OutputSpec(type="html"),
+        ],
     )
 
-    path = save_probe(probe)
-    console.print(f"[green]Probe '{name}' created at {path}[/green]")
-
-
-@main.command()
-@click.argument("name", required=False)
-@click.option("--format", "fmt", type=click.Choice(["table", "json"]), default="table", help="Output format")
-@click.option("--html", "html_path", type=click.Path(), default=None, help="Write HTML report to this path")
-@click.option("--strict", is_flag=True, help="Exit 2 on degraded probes (not just broken)")
-@click.option("--exit-code", is_flag=True, help="Use exit codes for CI (0=healthy, 1=broken, 2=degraded)")
-def check(name: str | None, fmt: str, html_path: str | None, strict: bool, exit_code: bool) -> None:
-    """Run probes and report health status.
-
-    Run all probes:     probelab check
-    Run one probe:      probelab check hackernews
-    CI mode:            probelab check --exit-code --format json
-    HTML report:        probelab check --html report.html
-    """
-    if name:
-        probe_path = PROBES_DIR / f"{name}.toml"
-        if not probe_path.exists():
-            console.print(f"[red]Probe '{name}' not found.[/red]")
-            sys.exit(1)
-        probes = [load_probe(probe_path)]
+    probe_path = PROBES_DIR / "hackernews.yaml"
+    if not probe_path.exists():
+        save_probe_yaml(example, probe_path)
+        console.print(f"[green]Created[/] {probe_path}")
     else:
-        probes = load_all_probes()
+        console.print(f"[dim]Already exists:[/] {probe_path}")
+
+    console.print(f"\n[bold]probelab initialized at {HOME}[/]")
+    console.print(f"  Probes: {PROBES_DIR}")
+    console.print(f"\nTry: [bold]probelab check {probe_path}[/]")
+
+
+@app.command()
+def check(
+    probe_path: Optional[str] = typer.Argument(None, help="Path to probe YAML file"),
+    cdp: Optional[str] = typer.Option(None, help="CDP endpoint (e.g., ws://localhost:9222)"),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show detailed results"),
+):
+    """Run one or all probes and show results."""
+    from probelab.io.loader import load_probe, load_all_probes
+    from probelab.io.store import append_history, save_baseline, save_run
+    from probelab.engine import run_probe, run_all_probes
+    from probelab.report.terminal import print_results, print_result_detail, print_json
+    from probelab.models.result import Status
+
+    if probe_path:
+        # Run single probe
+        path = Path(probe_path)
+        if not path.exists():
+            console.print(f"[red]Probe not found:[/] {path}")
+            raise typer.Exit(1)
+        probe = load_probe(path)
+        results = [run_probe(probe, cdp_url=cdp)]
+    else:
+        # Run all probes
+        if not PROBES_DIR.exists():
+            console.print(f"[red]No probes directory.[/] Run [bold]probelab init[/] first.")
+            raise typer.Exit(1)
+        probes = load_all_probes(PROBES_DIR)
         if not probes:
-            console.print("[yellow]No probes configured. Run 'probelab init' to create one.[/yellow]")
-            return
+            console.print(f"[dim]No probes found in {PROBES_DIR}[/]")
+            raise typer.Exit(0)
+        results = run_all_probes(probes, cdp_url=cdp)
 
-    from probelab.runner import browser_available
-    browser_probes = sum(1 for p in probes if p.browser)
-    if browser_probes:
-        if not browser_available():
-            console.print(f"[dim]{browser_probes} probe(s) need browser — install with:[/dim] pip install probelab[browser]")
-        else:
-            from probelab.browser import check_cdp_available
-            if check_cdp_available():
-                console.print(f"[green]Chrome CDP detected[/green] — {browser_probes} browser probe(s) will use your real Chrome")
-            else:
-                console.print(f"[yellow]{browser_probes} browser probe(s) will use headless mode[/yellow]")
-                console.print(f"[dim]For best results, start Chrome with: --remote-debugging-port=9222[/dim]")
-    console.print(f"Running {len(probes)} probe(s)...\n")
-    results = run_all_probes(probes)
-
-    # Save results to history (skip probes that weren't actually tested)
+    # Save results
     for result in results:
-        if result.status.value != "skipped":
-            save_history(result.probe_name, result.to_dict())
+        result_dict = result.to_dict()
+        append_history(result.probe_name, result_dict, HOME)
+        save_run(result_dict, HOME)
+        if result.status == Status.HEALTHY:
+            save_baseline(result.probe_name, result_dict, HOME)
 
-    if fmt == "json":
+    # Output
+    if json_output:
         print_json(results)
+    elif verbose:
+        for result in results:
+            print_result_detail(result, console)
     else:
-        print_table(results, console)
+        print_results(results, console)
 
-    # HTML report
-    if html_path:
-        from probelab.html_report import write_html_report
-        history_map = {r.probe_name: load_history(r.probe_name, limit=30) for r in results}
-        path = write_html_report(html_path, results, history_map)
-        console.print(f"\n[green]HTML report written to {path}[/green]")
-
-    if exit_code:
-        has_broken = any(r.status.value in ("broken", "error") for r in results)
-        has_degraded = any(r.status.value == "degraded" for r in results)
-        if has_broken:
-            sys.exit(1)
-        if strict and has_degraded:
-            sys.exit(2)
+    # Exit code
+    if any(r.status in (Status.BROKEN, Status.ERROR) for r in results):
+        raise typer.Exit(1)
 
 
-@main.command("list")
-@click.option("--tag", help="Filter by tag")
-def list_probes(tag: str | None) -> None:
-    """List all configured probes."""
-    probes = load_all_probes()
-    if not probes:
-        console.print("[yellow]No probes configured. Run 'probelab init' to create one.[/yellow]")
-        return
+@app.command()
+def show(
+    probe_name: str = typer.Argument(..., help="Probe name"),
+):
+    """Show the last run result for a probe."""
+    from probelab.io.store import load_last_run
+    from probelab.models.result import RunResult, Status
 
-    if tag:
-        probes = [p for p in probes if tag in p.tags]
+    last = load_last_run(probe_name, HOME)
+    if not last:
+        console.print(f"[dim]No runs found for '{probe_name}'[/]")
+        raise typer.Exit(0)
 
-    from rich.table import Table
+    # Reconstruct RunResult for display
+    from probelab.report.terminal import print_result_detail
 
-    table = Table(title="Configured Probes")
-    table.add_column("Name", style="bold")
-    table.add_column("URL")
-    table.add_column("Checks", justify="right")
-    table.add_column("Tags")
-
-    for probe in probes:
-        table.add_row(
-            probe.name,
-            probe.url,
-            str(len(probe.checks)),
-            ", ".join(probe.tags) if probe.tags else "-",
+    result = RunResult(
+        probe_name=last.get("probe_name", probe_name),
+        url=last.get("url", ""),
+        status=Status(last.get("status", "unknown")),
+        started_at=last.get("started_at", ""),
+        duration_ms=last.get("duration_ms", 0),
+        tags=last.get("tags", []),
+    )
+    if last.get("failure"):
+        from probelab.models.result import FailureClassification
+        f = last["failure"]
+        result.failure = FailureClassification(
+            category=f.get("category", "unknown"),
+            message=f.get("message", ""),
         )
 
-    console.print(table)
+    print_result_detail(result, console)
 
 
-@main.command()
-@click.argument("name")
-def show(name: str) -> None:
-    """Show details of a specific probe."""
-    probe_path = PROBES_DIR / f"{name}.toml"
-    if not probe_path.exists():
-        console.print(f"[red]Probe '{name}' not found.[/red]")
-        sys.exit(1)
+@app.command()
+def diff(
+    probe_name: str = typer.Argument(..., help="Probe name"),
+):
+    """Compare latest run vs baseline."""
+    from probelab.io.store import load_last_run, load_baseline
 
-    probe = load_probe(probe_path)
-    console.print(f"[bold]Probe: {probe.name}[/bold]")
-    console.print(f"  URL:     {probe.url}")
-    console.print(f"  Method:  {probe.method}")
-    console.print(f"  Timeout: {probe.timeout}s")
-    console.print(f"  Browser: {probe.browser}")
-    if probe.tags:
-        console.print(f"  Tags:    {', '.join(probe.tags)}")
+    last = load_last_run(probe_name, HOME)
+    baseline = load_baseline(probe_name, HOME)
+
+    if not last:
+        console.print(f"[dim]No runs found for '{probe_name}'[/]")
+        raise typer.Exit(0)
+    if not baseline:
+        console.print(f"[dim]No baseline for '{probe_name}'. Run a successful check first.[/]")
+        raise typer.Exit(0)
+
+    console.print(f"\n[bold]{probe_name}[/]")
+    console.print(f"  Baseline: {baseline.get('started_at', '?')} ([green]healthy[/])")
+    console.print(f"  Current:  {last.get('started_at', '?')} ([{'green' if last.get('status') == 'healthy' else 'red'}]{last.get('status', '?')}[/])")
+
+    from probelab.diff import compute_assertion_changes
+
+    changes = compute_assertion_changes(baseline, last)
+
+    if changes:
+        console.print(f"\n  [bold]Changes:[/]")
+        for change in changes:
+            console.print(change)
+    else:
+        console.print(f"\n  [green]No changes from baseline.[/]")
+
+    # Show failure classification if current is failed
+    if last.get("failure"):
+        f = last["failure"]
+        console.print(f"\n  [bold]Classification:[/] [{STATUS_COLORS.get(f.get('category', ''), 'red')}]{f.get('category', '?')}[/]")
+        console.print(f"  {f.get('message', '')}")
+
     console.print()
 
-    if probe.checks:
-        console.print("[bold]Checks:[/bold]")
-        for i, check in enumerate(probe.checks, 1):
-            bounds = f">={check.expect_min}"
-            if check.expect_max is not None:
-                bounds += f", <={check.expect_max}"
-            console.print(f"  {i}. {check.selector}  ({bounds}, extract={check.extract})")
-    else:
-        console.print("[yellow]  No checks defined.[/yellow]")
 
-    if probe.schema:
-        import json
-
-        console.print()
-        console.print("[bold]Schema:[/bold]")
-        console.print(f"  {json.dumps(probe.schema, indent=2)}")
+STATUS_COLORS = {
+    "auth_expired": "yellow",
+    "captcha_detected": "yellow",
+    "selector_missing": "red",
+    "timeout": "red",
+    "navigation_error": "red",
+    "unknown": "dim",
+}
 
 
-@main.command()
-@click.argument("name")
-@click.confirmation_option(prompt="Are you sure you want to remove this probe?")
-def remove(name: str) -> None:
-    """Remove a probe definition."""
-    if remove_probe(name):
-        console.print(f"[green]Probe '{name}' removed.[/green]")
-    else:
-        console.print(f"[red]Probe '{name}' not found.[/red]")
-        sys.exit(1)
+@app.command()
+def diagnose(
+    probe_name: str = typer.Argument(..., help="Probe name"),
+):
+    """Show failure diagnosis and repair suggestions."""
+    from probelab.io.store import load_last_run
+
+    last = load_last_run(probe_name, HOME)
+    if not last:
+        console.print(f"[dim]No runs found for '{probe_name}'[/]")
+        raise typer.Exit(0)
+
+    if last.get("status") == "healthy":
+        console.print(f"[green]{probe_name} is healthy. Nothing to diagnose.[/]")
+        raise typer.Exit(0)
+
+    # Show failure
+    failure = last.get("failure", {})
+    console.print(f"\n[bold]{probe_name}[/] — [red]{last.get('status', '?')}[/]")
+    console.print(f"  Category: [bold]{failure.get('category', 'unknown')}[/]")
+    console.print(f"  Message: {failure.get('message', '')}")
+
+    # For selector_missing, try to suggest repairs
+    if failure.get("category") == "selector_missing":
+        _suggest_repairs(probe_name, last, console)
+
+    # For auth_expired, suggest re-login
+    elif failure.get("category") == "auth_expired":
+        console.print(f"\n  [bold]Action:[/] Re-login in Chrome, then re-run:")
+        console.print(f"    probelab check --cdp ws://localhost:9222 ~/.probelab/probes/{probe_name}.yaml")
+
+    # For captcha_detected, suggest manual visit
+    elif failure.get("category") == "captcha_detected":
+        url = last.get("url", "")
+        console.print(f"\n  [bold]Action:[/] Open {url} manually, solve the CAPTCHA, then re-run.")
+
+    console.print()
 
 
-@main.command()
-@click.argument("name")
-@click.option("--limit", type=int, default=30, help="Number of recent results to show")
-def history(name: str, limit: int) -> None:
-    """Show match-count timeline and run history for a probe."""
-    from probelab.viz import render_timeline
-
-    results = load_history(name, limit=limit)
-    if not results:
-        console.print(f"[yellow]No history for probe '{name}'.[/yellow]")
+def _suggest_repairs(probe_name: str, last_run: dict, console: Console) -> None:
+    """Use repair.py to suggest selector replacements."""
+    try:
+        from probelab.repair import suggest_repairs
+    except ImportError:
+        console.print(f"\n  [dim]Repair suggestions require the repair module.[/]")
         return
 
-    render_timeline(name, results, console)
+    # Find the broken selector from assertions
+    broken_assertions = [
+        a for a in last_run.get("assertions", [])
+        if a.get("status") == "failed" and a.get("selector")
+    ]
 
-
-@main.command()
-def status() -> None:
-    """Health dashboard — one-screen overview of all probes."""
-    from probelab.viz import render_health_dashboard
-
-    probes = load_all_probes()
-    if not probes:
-        console.print("[yellow]No probes configured.[/yellow]")
+    if not broken_assertions:
+        console.print(f"\n  [dim]No selector assertions to repair.[/]")
         return
 
-    probes_history: dict[str, list] = {}
-    for probe in probes:
-        hist = load_history(probe.name, limit=30)
-        probes_history[probe.name] = hist
-
-    render_health_dashboard(probes_history, console)
-
-
-@main.command()
-@click.argument("name")
-def baseline(name: str) -> None:
-    """Show learned baseline statistics and suggested thresholds for a probe.
-
-    Requires at least 5 history entries. Run 'probelab check' several times first.
-    """
-    from probelab.baseline import compute_baseline, suggest_expectations
-    from rich.table import Table
-
-    baselines = compute_baseline(name)
-    if not baselines:
-        console.print(f"[yellow]Not enough history for probe '{name}' (need 5+ runs).[/yellow]")
+    # We need the HTML to run repair suggestions
+    # Check if we have an HTML artifact
+    artifacts = last_run.get("artifacts", {})
+    html_path = artifacts.get("html")
+    if not html_path:
+        console.print("\n  [dim]No HTML artifact saved. Add 'outputs: \\[type: html]' to the probe and re-run.[/]")
         return
 
-    table = Table(title=f"Baseline: {name}")
-    table.add_column("Selector")
-    table.add_column("Mean", justify="right")
-    table.add_column("Stddev", justify="right")
-    table.add_column("Range", justify="right")
-    table.add_column("Suggested Min", justify="right")
-    table.add_column("Suggested Max", justify="right")
-    table.add_column("Samples", justify="right")
+    try:
+        html = Path(html_path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        console.print(f"\n  [dim]HTML artifact not found at {html_path}[/]")
+        return
 
-    suggestions = suggest_expectations(baselines)
+    for broken in broken_assertions:
+        selector = broken["selector"]
+        console.print(f"\n  [bold]Selector:[/] {selector} -> {broken.get('actual', '0 matches')}")
 
-    for selector, stats in baselines.items():
-        sugg = suggestions.get(selector, {})
-        table.add_row(
-            selector[:50],
-            f"{stats.mean:.1f}",
-            f"{stats.stddev:.1f}",
-            f"{stats.min_seen}-{stats.max_seen}",
-            str(sugg.get("expect_min", "?")),
-            str(sugg.get("expect_max", "?")),
-            str(stats.sample_count),
+        suggestions = suggest_repairs(
+            html=html,
+            broken_selector=selector,
+            target_min=1,
+            max_suggestions=3,
         )
 
-    console.print(table)
+        if suggestions:
+            console.print(f"\n  [bold]Suggested replacements:[/]")
+            for i, s in enumerate(suggestions, 1):
+                conf = f"{s.confidence:.0%}"
+                console.print(f"    {i}. [green]{s.selector}[/] -> {s.match_count} matches (confidence: {conf})")
+                if s.reason:
+                    console.print(f"       [dim]{s.reason}[/]")
+        else:
+            console.print(f"  [dim]No alternative selectors found.[/]")
 
 
-@main.command()
-@click.argument("name")
-def diff(name: str) -> None:
-    """Show DOM structural diff as a tree view.
-
-    Compares the current snapshot against the previous one, showing
-    added, removed, and renamed elements in a tree hierarchy.
-    """
-    from probelab.differ import load_snapshot
-    from probelab.viz import render_dom_diff_tree
-
-    snapshot = load_snapshot(name)
-    if not snapshot:
-        console.print(f"[yellow]No snapshot for '{name}'. Run 'probelab check' first.[/yellow]")
-        return
-
-    # Check if we have a previous snapshot stored in history
-    hist = load_history(name, limit=10)
-    old_snapshot = None
-    for entry in reversed(hist):
-        dd = entry.get("dom_diff")
-        if dd and dd.get("old_hash") and dd["old_hash"] != snapshot.get("hash"):
-            # We need the actual old snapshot, not just the diff.
-            # Build a synthetic "old" snapshot from the diff info.
-            # The real old snapshot is gone, but we can reconstruct
-            # paths from the current snapshot + the diff changes.
-            break
-
-    # For now, show the current snapshot as a tree.
-    # If the last check recorded a diff, show it.
-    last_diff = None
-    if hist:
-        last_entry = hist[-1]
-        last_diff = last_entry.get("dom_diff")
-
-    if last_diff and last_diff.get("changed"):
-        # Reconstruct old paths from current paths + diff changes
-        current_paths = set(snapshot.get("paths", []))
-        changes = last_diff.get("changes", [])
-        removed_paths = {c["path"] for c in changes if c["type"] == "removed"}
-        added_paths = {c["path"] for c in changes if c["type"] == "added"}
-        old_paths = (current_paths | removed_paths) - added_paths
-
-        old_synthetic = {"paths": sorted(old_paths), "hash": last_diff.get("old_hash", "?")}
-        new_synthetic = {"paths": snapshot.get("paths", []), "hash": snapshot.get("hash", "?")}
-        render_dom_diff_tree(old_synthetic, new_synthetic, console)
-    else:
-        console.print(f"[bold]Current snapshot for {name}[/bold]")
-        console.print(f"  Hash: {snapshot.get('hash', '?')}")
-        console.print(f"  No previous diff available — run 'probelab check' after a site change.")
-
-
-@main.command("import-opencli")
-@click.argument("path", type=click.Path(exists=True, file_okay=False))
-@click.option("--dry-run", is_flag=True, help="Show what would be imported without saving")
-@click.option("--force", is_flag=True, help="Overwrite existing probes with the same name")
-@click.option("--tag", "extra_tags", multiple=True, help="Additional tags for imported probes")
-def import_opencli_cmd(path: str, dry_run: bool, force: bool, extra_tags: tuple[str, ...]) -> None:
-    """Import probe definitions from an opencli repository.
-
-    Scans the given PATH for opencli adapter files, extracts CSS
-    selectors and URLs, and generates probelab probes.
-
-    Example:
-
-        probelab import-opencli ~/code/opencli
-        probelab import-opencli ./opencli --dry-run
-    """
-    from pathlib import Path as P
-
+@app.command("import-opencli")
+def import_opencli_cmd(
+    path: str = typer.Argument(..., help="Path to opencli repository"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be imported without saving"),
+    force: bool = typer.Option(False, "--force", help="Overwrite existing probes with the same name"),
+    extra_tags: Optional[list[str]] = typer.Option(None, "--tag", help="Additional tags for imported probes"),
+):
+    """Import probe definitions from an opencli repository."""
     from probelab.opencli import import_opencli, scan_opencli_dir, adapters_to_probes
 
-    opencli_path = P(path)
+    opencli_path = Path(path)
+    if not opencli_path.exists():
+        console.print(f"[red]Path not found:[/] {path}")
+        raise typer.Exit(1)
 
     if dry_run:
         adapters = scan_opencli_dir(opencli_path)
@@ -419,6 +372,322 @@ def import_opencli_cmd(path: str, dry_run: bool, force: bool, extra_tags: tuple[
     if result.created_paths:
         console.print(f"\n[green]Probes saved to .probelab/probes/[/green]")
         console.print(f"Run 'probelab check' to test them.")
+
+
+@app.command()
+def scan(
+    path: str = typer.Argument(".", help="Project directory to scan (defaults to current dir)"),
+    accept: bool = typer.Option(False, "--accept", "-y", help="Accept all and write probe files immediately"),
+    min_confidence: float = typer.Option(0.5, "--min-confidence", help="Minimum confidence threshold (0.0-1.0)"),
+    output_dir: Optional[str] = typer.Option(None, "--output", "-o", help="Output directory for probe files"),
+):
+    """Scan your project for external web and API dependencies.
+
+    Finds URLs, API SDKs, selectors, and env vars in your code,
+    then generates probe YAML files for monitoring each one.
+
+    Examples:
+
+        probelab scan                  # scan current directory
+        probelab scan ~/my-project     # scan a specific project
+        probelab scan --accept         # scan and write probes immediately
+    """
+    from rich.table import Table
+
+    from probelab.scan.scanner import scan_directory
+    from probelab.scan.generate import dependencies_to_probes, write_probes
+
+    scan_path = Path(path).resolve()
+    if not scan_path.is_dir():
+        console.print(f"[red]Not a directory:[/] {path}")
+        raise typer.Exit(1)
+
+    console.print(f"\n[bold]Scanning {scan_path.name}/[/] ...\n")
+
+    deps = scan_directory(scan_path)
+
+    # Filter by confidence
+    deps = [d for d in deps if d.confidence >= min_confidence]
+
+    if not deps:
+        console.print("[dim]No external dependencies found.[/]")
+        console.print("[dim]Try lowering --min-confidence, or check that the directory has source files.[/]")
+        raise typer.Exit(0)
+
+    # Separate web and API deps
+    web_deps = [d for d in deps if d.kind == "web"]
+    api_deps = [d for d in deps if d.kind == "api"]
+
+    console.print(f"  Found [bold]{len(deps)}[/] external dependencies:\n")
+
+    # Display results
+    if api_deps:
+        api_table = Table(title=f"API Dependencies ({len(api_deps)})", show_lines=False)
+        api_table.add_column("Provider", style="bold cyan")
+        api_table.add_column("Source")
+        api_table.add_column("Env Key", style="dim")
+        api_table.add_column("Confidence", justify="right")
+
+        for dep in api_deps:
+            api_table.add_row(
+                dep.provider,
+                f"{dep.source_file}:{dep.source_line}",
+                dep.env_key or "-",
+                f"{dep.confidence:.0%}",
+            )
+        console.print(api_table)
+        console.print()
+
+    if web_deps:
+        web_table = Table(title=f"Web Dependencies ({len(web_deps)})", show_lines=False)
+        web_table.add_column("URL", style="bold")
+        web_table.add_column("Source")
+        web_table.add_column("Selectors")
+        web_table.add_column("Confidence", justify="right")
+
+        for dep in web_deps:
+            sel_str = ", ".join(dep.selectors[:2])
+            if len(dep.selectors) > 2:
+                sel_str += f" +{len(dep.selectors) - 2}"
+            web_table.add_row(
+                (dep.url or "")[:60],
+                f"{dep.source_file}:{dep.source_line}",
+                sel_str or "-",
+                f"{dep.confidence:.0%}",
+            )
+        console.print(web_table)
+        console.print()
+
+    # Generate probes
+    probes = dependencies_to_probes(deps)
+
+    if not probes:
+        console.print("[dim]No probes could be generated from these dependencies.[/]")
+        raise typer.Exit(0)
+
+    console.print(f"  [bold]{len(probes)} probe(s)[/] ready to generate.\n")
+
+    if accept:
+        out = Path(output_dir) if output_dir else PROBES_DIR
+        from probelab.io.store import ensure_dirs
+        ensure_dirs(HOME)
+        written = write_probes(probes, out)
+        console.print(f"  [green]Wrote {len(written)} probe file(s) to {out}/[/]")
+        if written:
+            console.print(f"\n  Run [bold]probelab check[/] to test them.")
+    else:
+        # Preview mode
+        console.print("  [dim]Probes not written yet. Run with [bold]--accept[/bold] to save them.[/]")
+        console.print(f"  [dim]Or: probelab scan {path} --accept[/]")
+        console.print()
+
+        # Show a preview of each probe
+        for probe in probes[:10]:
+            kind_color = "cyan" if probe.get("target", {}).get("type") == "api" else "green"
+            assertions = probe.get("assertions", [])
+            assert_summary = ", ".join(a.get("type", "?") for a in assertions[:3])
+            console.print(
+                f"    [{kind_color}]{probe.get('target', {}).get('type', '?')}[/{kind_color}]  "
+                f"[bold]{probe['name']}[/]  "
+                f"[dim]{assert_summary}[/]"
+            )
+
+        remaining = len(probes) - 10
+        if remaining > 0:
+            console.print(f"    [dim]... and {remaining} more[/]")
+        console.print()
+
+
+@app.command()
+def doctor(
+    path: str = typer.Argument(".", help="Project directory to scan"),
+    min_confidence: float = typer.Option(0.8, "--min-confidence", help="Minimum confidence threshold"),
+    timeout: int = typer.Option(15, "--timeout", help="Request timeout in seconds"),
+    verify_keys: bool = typer.Option(False, "--verify-keys", help="Actually send API keys to verify they work (opt-in)"),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
+):
+    """Scan your project and check all external dependencies RIGHT NOW.
+
+    Combines scan + check in one step: discovers your web and API
+    dependencies, then immediately tests each one and reports status.
+
+    SAFE BY DEFAULT: API keys are never sent anywhere. probelab only
+    checks if the env var is set and the service endpoint is reachable.
+    Use --verify-keys to opt in to actual key validation.
+
+    Examples:
+
+        probelab doctor                      # scan + check (safe mode)
+        probelab doctor ~/my-project         # scan a specific project
+        probelab doctor --verify-keys        # actually validate API keys
+    """
+    import json
+    from rich.table import Table
+
+    from probelab.scan.scanner import scan_directory
+    from probelab.scan.api_check import check_api, ApiCheckResult
+
+    scan_path = Path(path).resolve()
+    if not scan_path.is_dir():
+        console.print(f"[red]Not a directory:[/] {path}")
+        raise typer.Exit(1)
+
+    console.print(f"\n[bold]probelab doctor[/] — scanning {scan_path.name}/ ...\n")
+
+    deps = scan_directory(scan_path)
+    deps = [d for d in deps if d.confidence >= min_confidence]
+
+    if not deps:
+        console.print("[green]No external dependencies found. Nothing to check.[/]")
+        raise typer.Exit(0)
+
+    api_deps = [d for d in deps if d.kind == "api"]
+    web_deps = [d for d in deps if d.kind == "web"]
+
+    all_results: list[dict] = []
+    has_failures = False
+
+    # === Check API dependencies ===
+    if api_deps:
+        console.print(f"  Checking {len(api_deps)} API dependencies...\n")
+
+        api_table = Table(show_lines=False)
+        api_table.add_column("", width=2)
+        api_table.add_column("Provider", style="bold")
+        api_table.add_column("Status")
+        api_table.add_column("Message")
+        api_table.add_column("Time", justify="right")
+
+        if not verify_keys:
+            console.print(f"  [dim]Safe mode: keys are NOT sent. Use --verify-keys to validate them.[/]\n")
+
+        for dep in api_deps:
+            result = check_api(dep.provider, env_key=dep.env_key or None, timeout=timeout, verify_key=verify_keys)
+
+            icon, color = _status_display(result.status)
+            time_str = f"{result.response_time_ms}ms" if result.response_time_ms else "-"
+
+            api_table.add_row(
+                icon,
+                result.provider,
+                f"[{color}]{result.status}[/{color}]",
+                result.message[:60],
+                time_str,
+            )
+
+            if result.status not in ("healthy",):
+                has_failures = True
+
+            all_results.append({"kind": "api", **result.to_dict()})
+
+        console.print(api_table)
+        console.print()
+
+    # === Check web dependencies (basic reachability) ===
+    if web_deps:
+        console.print(f"  Checking {len(web_deps)} web dependencies...\n")
+
+        web_table = Table(show_lines=False)
+        web_table.add_column("", width=2)
+        web_table.add_column("URL", style="bold")
+        web_table.add_column("Status")
+        web_table.add_column("Details")
+        web_table.add_column("Time", justify="right")
+
+        with httpx.Client(
+            timeout=timeout,
+            follow_redirects=True,
+            headers={"User-Agent": "probelab/1.0"},
+        ) as client:
+            for dep in web_deps:
+                if not dep.url:
+                    continue
+                web_result = _check_web_dep(client, dep.url)
+                icon, color = _status_display(web_result["status"])
+                time_str = f"{web_result.get('response_time_ms', 0)}ms"
+
+                web_table.add_row(
+                    icon,
+                    (dep.url or "")[:55],
+                    f"[{color}]{web_result['status']}[/{color}]",
+                    web_result.get("message", "")[:50],
+                    time_str,
+                )
+
+                if web_result["status"] != "healthy":
+                    has_failures = True
+
+                all_results.append({"kind": "web", "url": dep.url, **web_result})
+
+        console.print(web_table)
+        console.print()
+
+    # === Summary ===
+    total = len(all_results)
+    healthy = sum(1 for r in all_results if r.get("status") == "healthy")
+    no_key = sum(1 for r in all_results if r.get("status") == "no_key")
+    broken = total - healthy - no_key
+
+    if json_output:
+        print(json.dumps({"results": all_results, "summary": {"total": total, "healthy": healthy, "broken": broken, "no_key": no_key}}, indent=2))
+    else:
+        parts = []
+        if broken:
+            parts.append(f"[red]{broken} broken[/]")
+        if no_key:
+            parts.append(f"[yellow]{no_key} no key[/]")
+        parts.append(f"[green]{healthy} healthy[/]")
+        console.print(f"  {total} dependencies: {', '.join(parts)}")
+        console.print()
+
+    if has_failures:
+        raise typer.Exit(1)
+
+
+def _check_web_dep(client: httpx.Client, url: str) -> dict:
+    """Quick health check on a web URL."""
+    try:
+        start = time.monotonic()
+        response = client.get(url)
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+
+        if response.status_code == 200:
+            return {"status": "healthy", "message": f"HTTP {response.status_code}", "response_time_ms": elapsed_ms}
+        elif response.status_code in (301, 302, 307, 308):
+            return {"status": "healthy", "message": f"Redirect -> {response.headers.get('location', '?')[:40]}", "response_time_ms": elapsed_ms}
+        elif response.status_code == 403:
+            return {"status": "healthy", "message": "HTTP 403 (blocked but reachable)", "response_time_ms": elapsed_ms}
+        elif response.status_code == 404:
+            return {"status": "broken", "message": "HTTP 404 — page not found", "response_time_ms": elapsed_ms}
+        elif response.status_code >= 500:
+            return {"status": "broken", "message": f"HTTP {response.status_code} — server error", "response_time_ms": elapsed_ms}
+        else:
+            return {"status": "healthy", "message": f"HTTP {response.status_code}", "response_time_ms": elapsed_ms}
+    except httpx.ConnectError:
+        return {"status": "broken", "message": "Connection failed — DNS or network error"}
+    except httpx.TimeoutException:
+        return {"status": "broken", "message": "Timed out"}
+    except httpx.RequestError as e:
+        return {"status": "broken", "message": str(e)[:60]}
+
+
+def _status_display(status: str) -> tuple[str, str]:
+    """Return (icon, color) for a status string."""
+    if status == "healthy":
+        return ("[green]\u2713[/]", "green")
+    elif status == "no_key":
+        return ("[yellow]?[/]", "yellow")
+    elif status in ("auth_expired", "auth_invalid"):
+        return ("[red]\u2717[/]", "red")
+    elif status in ("broken", "service_down", "unreachable"):
+        return ("[red]![/]", "red")
+    else:
+        return ("[dim]-[/]", "dim")
+
+
+def main():
+    """Entry point."""
+    app()
 
 
 if __name__ == "__main__":

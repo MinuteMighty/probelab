@@ -3,9 +3,9 @@
 from pathlib import Path
 
 import pytest
-from click.testing import CliRunner
+from typer.testing import CliRunner
 
-from probelab.cli import main
+from probelab.cli import app
 from probelab.config import PROBES_DIR
 from probelab.opencli import (
     ParsedAdapter,
@@ -487,38 +487,42 @@ class TestCliImportOpencli:
             "hackernews": {"trending": SAMPLE_TS_ADAPTER},
         })
         runner = CliRunner()
-        result = runner.invoke(main, ["import-opencli", str(root), "--dry-run"])
+        result = runner.invoke(app, ["import-opencli", str(root), "--dry-run"])
         assert result.exit_code == 0
         assert "hackernews-tren" in result.output  # Rich may truncate in narrow terminal
         assert "Dry Run" in result.output
 
-    def test_import_creates_probes(self, tmp_path):
+    def test_import_creates_probes(self, tmp_path, monkeypatch):
         root = _make_opencli_dir(tmp_path, {
             "hackernews": {"trending": SAMPLE_TS_ADAPTER},
         })
+        work_dir = tmp_path / "workdir"
+        work_dir.mkdir()
+        monkeypatch.chdir(work_dir)
         runner = CliRunner()
-        with runner.isolated_filesystem():
-            result = runner.invoke(main, ["import-opencli", str(root)])
-            assert result.exit_code == 0
-            assert "Probes created" in result.output
-            assert (PROBES_DIR / "hackernews-trending.toml").exists()
+        result = runner.invoke(app, ["import-opencli", str(root)])
+        assert result.exit_code == 0
+        assert "Probes created" in result.output
+        assert (work_dir / PROBES_DIR / "hackernews-trending.toml").exists()
 
     def test_empty_dir_message(self, tmp_path):
         root = tmp_path / "empty"
         root.mkdir()
         runner = CliRunner()
-        result = runner.invoke(main, ["import-opencli", str(root), "--dry-run"])
+        result = runner.invoke(app, ["import-opencli", str(root), "--dry-run"])
         assert result.exit_code == 0
         assert "No adapters" in result.output
 
-    def test_with_extra_tags(self, tmp_path):
+    def test_with_extra_tags(self, tmp_path, monkeypatch):
         root = _make_opencli_dir(tmp_path, {
             "hackernews": {"trending": SAMPLE_TS_ADAPTER},
         })
+        work_dir = tmp_path / "workdir"
+        work_dir.mkdir()
+        monkeypatch.chdir(work_dir)
         runner = CliRunner()
-        with runner.isolated_filesystem():
-            result = runner.invoke(main, [
-                "import-opencli", str(root), "--tag", "ci", "--tag", "nightly",
-            ])
-            assert result.exit_code == 0
-            assert "Probes created" in result.output
+        result = runner.invoke(app, [
+            "import-opencli", str(root), "--tag", "ci", "--tag", "nightly",
+        ])
+        assert result.exit_code == 0
+        assert "Probes created" in result.output
