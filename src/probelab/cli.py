@@ -72,6 +72,85 @@ def init():
 
 
 @app.command()
+def login(
+    url: str = typer.Argument(..., help="URL to open for login (e.g., https://www.zhihu.com)"),
+):
+    """Open Chrome and wait for you to log in.
+
+    Launches Chrome with your real profile and CDP enabled,
+    navigates to the URL, then waits for you to log in manually
+    (scan QR code, enter credentials, etc.).
+
+    After you're done, press Enter and Chrome stays running.
+    Subsequent 'probelab check' commands will use your session.
+
+    Example:
+
+        probelab login https://www.zhihu.com
+        # ... log in in the browser ...
+        # press Enter
+        probelab check probes/zhihu-cdp.yaml
+    """
+    from probelab.browser import check_cdp_available, ensure_chrome_cdp, DEFAULT_CDP_URL
+
+    console.print(f"\n[bold]probelab login[/]\n")
+
+    # Step 1: ensure Chrome is running with CDP
+    endpoint = DEFAULT_CDP_URL
+    if not check_cdp_available(endpoint):
+        console.print("  Launching Chrome with your profile...")
+        if not ensure_chrome_cdp(endpoint):
+            console.print("[red]  Could not launch Chrome.[/]")
+            console.print("  Try manually: /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=9222 --user-data-dir=/tmp/probelab-chrome")
+            raise typer.Exit(1)
+        console.print("  [green]Chrome launched.[/]\n")
+    else:
+        console.print("  [green]Chrome already running with CDP.[/]\n")
+
+    # Step 2: open the URL in a new tab
+    try:
+        from playwright.sync_api import sync_playwright
+
+        console.print(f"  Opening {url} ...")
+
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(endpoint)
+            context = browser.contexts[0] if browser.contexts else browser.new_context()
+            page = context.new_page()
+            page.goto(url, wait_until="domcontentloaded")
+            page.bring_to_front()
+
+            console.print(f"  [green]Page opened.[/]\n")
+            console.print("  [bold]Log in now.[/] Scan QR code, enter credentials, whatever you need.")
+            console.print("  When you're done, come back here and press Enter.\n")
+
+            # Wait for user
+            input("  Press Enter when logged in → ")
+
+            # Verify we're no longer on a login page
+            current_url = page.url
+            console.print(f"\n  Current URL: {current_url}")
+
+            if any(kw in current_url.lower() for kw in ("login", "signin", "sign-in", "auth", "sso")):
+                console.print("  [yellow]Still looks like a login page. You may need to try again.[/]")
+            else:
+                console.print("  [green]Looks good! Session should be active.[/]")
+
+            console.print(f"\n  Chrome stays running. Now run:")
+            console.print(f"  [bold]probelab check <your-probe.yaml>[/]\n")
+
+            # Disconnect without closing Chrome
+            browser.close()
+
+    except ImportError:
+        console.print("[red]  Playwright not installed. Run: pip install probelab[browser][/]")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[red]  Error: {e}[/]")
+        raise typer.Exit(1)
+
+
+@app.command()
 def check(
     probe_path: Optional[str] = typer.Argument(None, help="Path to probe YAML file"),
     cdp: Optional[str] = typer.Option(None, help="CDP endpoint (e.g., ws://localhost:9222)"),
@@ -92,7 +171,7 @@ def check(
             console.print(f"[red]Probe not found:[/] {path}")
             raise typer.Exit(1)
         probe = load_probe(path)
-        results = [run_probe(probe, cdp_url=cdp)]
+        probes = [probe]
     else:
         # Run all probes
         if not PROBES_DIR.exists():
@@ -102,7 +181,38 @@ def check(
         if not probes:
             console.print(f"[dim]No probes found in {PROBES_DIR}[/]")
             raise typer.Exit(0)
-        results = run_all_probes(probes, cdp_url=cdp)
+
+    # Auto-launch Chrome if any probe needs a browser and CDP isn't running
+    needs_browser = any(
+        p.browser or any(s.action in ("click", "type", "wait_for_selector") for s in p.steps)
+        for p in probes
+    )
+    if needs_browser or cdp:
+        from probelab.browser import check_cdp_available, ensure_chrome_cdp, DEFAULT_CDP_URL
+        endpoint = cdp or DEFAULT_CDP_URL
+        if not check_cdp_available(endpoint):
+            console.print("[dim]Chrome CDP not running. Launching Chrome...[/]")
+            if ensure_chrome_cdp(endpoint):
+                console.print("[green]Chrome launched with debugging enabled.[/]")
+            else:
+                console.print("[yellow]Could not launch Chrome. Browser probes may use headless mode.[/]")
+
+    results = run_all_probes(probes, cdp_url=cdp)
+
+    # === Interactive auth retry ===
+    # If any probe failed due to auth and we're in a terminal (not CI),
+    # offer to open the browser for login and retry automatically.
+    if not json_output and _is_interactive():
+        auth_failures = [
+            (i, r) for i, r in enumerate(results)
+            if r.failure and r.failure.category == "auth_expired"
+        ]
+        if auth_failures:
+            retried = _handle_auth_retry(auth_failures, probes, cdp, console)
+            if retried:
+                # Replace failed results with retry results
+                for idx, new_result in retried:
+                    results[idx] = new_result
 
     # Save results
     for result in results:
@@ -683,6 +793,87 @@ def _status_display(status: str) -> tuple[str, str]:
         return ("[red]![/]", "red")
     else:
         return ("[dim]-[/]", "dim")
+
+
+def _is_interactive() -> bool:
+    """Check if we're in an interactive terminal (not piped/CI)."""
+    import sys
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _handle_auth_retry(
+    auth_failures: list[tuple[int, Any]],
+    probes: list,
+    cdp: str | None,
+    console: Console,
+) -> list[tuple[int, Any]] | None:
+    """Handle auth failures interactively: open browser, wait for login, retry.
+
+    Returns list of (index, new_result) if retried, or None if user skipped.
+    """
+    from probelab.browser import check_cdp_available, ensure_chrome_cdp, DEFAULT_CDP_URL
+    from probelab.engine import run_probe
+
+    # Collect unique URLs that need auth
+    urls = []
+    for _, result in auth_failures:
+        if result.url and result.url not in urls:
+            urls.append(result.url)
+
+    console.print()
+    console.print(f"  [yellow]{len(auth_failures)} probe(s) need login.[/]")
+    for url in urls[:3]:
+        console.print(f"    • {url}")
+
+    console.print()
+    response = input("  Open Chrome to log in? [Y/n] → ").strip().lower()
+    if response in ("n", "no"):
+        return None
+
+    # Ensure Chrome is running
+    endpoint = cdp or DEFAULT_CDP_URL
+    if not check_cdp_available(endpoint):
+        console.print("\n  Launching Chrome...")
+        if not ensure_chrome_cdp(endpoint):
+            console.print("  [red]Could not launch Chrome.[/]")
+            return None
+
+    # Open each URL in Chrome for login
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(endpoint)
+            context = browser.contexts[0] if browser.contexts else browser.new_context()
+
+            for url in urls:
+                console.print(f"\n  Opening {url} ...")
+                page = context.new_page()
+                page.goto(url, wait_until="domcontentloaded")
+                page.bring_to_front()
+
+            console.print()
+            console.print("  [bold]Log in now.[/] Scan QR code, enter credentials, etc.")
+            input("\n  Press Enter when done → ")
+
+            browser.close()
+
+    except ImportError:
+        console.print("  [red]Playwright not installed: pip install probelab[browser][/]")
+        return None
+    except Exception as e:
+        console.print(f"  [red]Error: {e}[/]")
+        return None
+
+    # Retry the failed probes
+    console.print("\n  Re-checking...\n")
+    retried: list[tuple[int, Any]] = []
+    for idx, old_result in auth_failures:
+        probe = probes[idx]
+        new_result = run_probe(probe, cdp_url=cdp)
+        retried.append((idx, new_result))
+
+    return retried
 
 
 def main():

@@ -144,7 +144,7 @@ def _run_browser(probe: Probe, started_at: str, start_time: float,
             "Browser mode requires playwright: pip install probelab[browser]",
         )
 
-    from probelab.browser import check_cdp_available, DEFAULT_CDP_URL
+    from probelab.browser import check_cdp_available, ensure_chrome_cdp, DEFAULT_CDP_URL
 
     url = probe.target.url or ""
     step_results: list[StepResult] = []
@@ -155,6 +155,10 @@ def _run_browser(probe: Probe, started_at: str, start_time: float,
 
     endpoint = cdp_url or DEFAULT_CDP_URL
     use_cdp = check_cdp_available(endpoint)
+
+    # Auto-launch Chrome with CDP if not running
+    if not use_cdp:
+        use_cdp = ensure_chrome_cdp(endpoint)
 
     try:
         with sync_playwright() as p:
