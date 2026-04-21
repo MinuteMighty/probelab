@@ -224,26 +224,113 @@ jobs:
 
 Commit your probe YAML files to the repo. CI runs them daily. If anything breaks, the job fails.
 
-## Advanced: pages that need login (CDP mode)
+## Python API: preflight checks for browser agents
 
-Some pages require authentication. probelab can use your real Chrome browser session:
+If you build with [browser-use](https://github.com/browser-use/browser-use), OpenClaw, or any browser agent, probelab saves you from wasting tokens on broken sites.
 
-```bash
-# Start Chrome with debugging
-/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222
+**The problem:** browser-use costs $0.02–4.00 per task. If the target site has a CAPTCHA, is down, or changed its selectors, the agent burns tokens failing. You find out after the money is spent.
 
-# Run probes using your login cookies
-probelab check --cdp ws://localhost:9222
+**The fix:** a $0, 200ms pre-flight check before the agent runs.
+
+```python
+from probelab import preflight
+
+# Check before spending tokens
+status = preflight("https://www.linkedin.com/jobs", checks=[
+    ("selector_exists", ".job-card"),
+    ("no_captcha",),
+    ("no_login_redirect",),
+])
+
+if status.healthy:
+    # Site is ready — run the expensive agent
+    from browser_use import Agent
+    agent = Agent(task="Apply to Senior Engineer jobs", llm=llm)
+    await agent.run()  # $0.30+
+else:
+    print(f"Skipping: {status.failure}")
+    # "captcha_detected" or "auth_expired" or "selector_missing"
+    # Saved $0.30
 ```
 
-No passwords stored. No tokens leaked. It uses your actual browser session.
+Works with any agent framework:
 
-## Advanced: import from OpenCLI
+```python
+from probelab import preflight
+
+# browser-use
+status = preflight("https://target.com")
+
+# OpenClaw agent-browser
+status = preflight("https://target.com")
+
+# LangChain / CrewAI / AutoGen — same thing
+status = preflight("https://target.com")
+```
+
+probelab doesn't care what browser tool you use. It answers one question before you start: **"Is this site ready for my agent, or will it waste money failing?"**
+
+### Quick inline checks (no YAML needed)
+
+```python
+from probelab import check_url
+
+# One-liner: is this page healthy?
+result = check_url("https://news.ycombinator.com", selectors=["tr.athing"])
+print(result.status)   # "healthy"
+print(result.matches)  # {"tr.athing": 30}
+
+# Check multiple things
+result = check_url("https://competitor.com/pricing",
+    selectors=[".pricing-card"],
+    text=["Free", "Enterprise"],
+)
+if result.broken:
+    print(result.failure)  # "selector_missing: .pricing-card not found"
+```
+
+### Diagnose agent failures after the fact
+
+```python
+from probelab import diagnose_url
+
+# Agent failed — why?
+diagnosis = diagnose_url("https://target.com",
+    broken_selector=".old-button",
+)
+for suggestion in diagnosis.repairs:
+    print(f"  Try: {suggestion.selector} ({suggestion.match_count} matches)")
+```
+
+## Pages that need login
+
+probelab auto-launches Chrome when a probe needs authentication:
+
+```bash
+probelab check probes/zhihu.yaml
+
+  zhihu: auth required — 1 probe(s) need login.
+
+  Open Chrome to log in? [Y/n] → y
+
+  Opening https://www.zhihu.com/ ...
+  Log in now. Scan QR code, enter credentials, etc.
+
+  Press Enter when done →
+
+  Re-checking...
+  ✓  zhihu   healthy   2481ms
+```
+
+One command. No manual Chrome flags.
+
+## Import from OpenCLI
 
 If you use [OpenCLI](https://github.com/jackwener/opencli), import its adapters as probes:
 
 ```bash
-probelab import-opencli ~/code/opencli
+probelab import-opencli ~/code/opencli    # generates probes from 196 adapters
+probelab check                            # test them all
 ```
 
 ## All commands
@@ -260,6 +347,8 @@ probelab import-opencli ~/code/opencli
 | `probelab show <name>` | Show last result |
 | `probelab diff <name>` | Compare against last healthy run |
 | `probelab diagnose <name>` | Failure analysis + fix suggestions |
+| `probelab login <url>` | Open Chrome, log in, keep session alive |
+| `probelab doctor [path]` | Scan + check all dependencies in one step |
 | `probelab import-opencli <path>` | Import OpenCLI adapters |
 
 ## Probe YAML reference
@@ -309,7 +398,7 @@ Python 3.11+.
 git clone https://github.com/MinuteMighty/probelab.git
 cd probelab
 pip install -e ".[dev]"
-python -m pytest tests/ -v   # 184 tests
+python -m pytest tests/ -v   # 231 tests
 ```
 
 ## License
